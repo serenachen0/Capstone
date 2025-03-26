@@ -1,0 +1,679 @@
+# UniRep2 Development Journal 
+
+Objective: refactor the UniRep model to ensure deterministic output and improve performance
+
+## Entry 0: Project Analysis and Planning
+
+### Problem Analysis
+Three major issues are identified with the original UniRep implementation:
+
+1. Non-deterministic Output: Running the same sequence through the model produces different results each time
+
+2. Performance Issues: Processing a single protein sequence takes ~1 second, which is 25x slower than transformer-based alternatives
+
+3. Outded Libraries: library dependencies used in the original implementation were severely outdated, createing challenges to address to the first 2 issues.
+
+#### Root Causes
+
+For the non-deterministic behavior, I identified the following potential causes:
+- Random initialization of weights/parameters
+- Non-deterministic GPU operations (especially reduce_mean)
+- Threading or parallelism issues
+
+#### Original Library Dependencies
+
+The original UniRep implementation used severely outdated libraries:
+
+| Library    | Original Version | Current Latest | Status            |
+|------------|-----------------|----------------|-------------------|
+| TensorFlow | 1.3.0          | 2.18.0        | Major API changes |
+| NumPy      | 1.15.4         | 2.1.0+        | API changes       |
+| Biopython  | Not specified   | 1.82+         | Minor changes     |
+| h5py       | Not specified   | 3.10.0+       | API changes       |
+
+This creates significant challenges as TensorFlow 1.3 was released in 2017 and lacks critical features for performance and reproducibility.
+
+#### Key Migration Challenges
+
+- TensorFlow 1.x to 2.x migration (completely different API)
+- RNN cell implementation changes
+- Session vs eager execution model differences
+- Deterministic operation support differences
+
+#### Preliminary Repository Structure
+
+```bash
+unirep/
+├── __init__.py           # Package exports
+├── config.py             # Configuration classes
+├── cells/                # LSTM cell implementations
+│   ├── __init__.py
+│   ├── base_cell.py      # Base LSTM cell class
+│   ├── mlstm_cell.py     # mLSTM cell implementation
+│   └── mlstm_stack.py    # Stacked mLSTM implementation
+├── models/               # Model implementations
+│   ├── __init__.py
+│   ├── base_model.py     # Base model class
+│   ├── unirep64.py       # 64-unit model
+│   ├── unirep256.py      # 256-unit model
+│   └── unirep1900.py     # 1900-unit model
+├── utils/                # Utility functions
+│   ├── __init__.py
+│   ├── sequence.py       # Sequence processing utilities
+│   ├── representation.py # Representation utilities
+│   └── tensor_utils.py   # TensorFlow utilities
+├── cli/                  # Command line interface
+│   ├── __init__.py
+│   ├── seq2rep.py        # Sequence to representation CLI
+│   └── rep_compare.py    # Representation comparison CLI
+├── requirements.txt      # Modern dependencies
+├── setup.py              # Package installation
+├── tests/                # Test suite
+│   ├── test_config.py    # Configuration tests
+│   ├── test_cells.py     # Cell implementation tests
+│   ├── test_models.py    # Model implementation tests
+│   └── test_determinism.py # Determinism tests
+└── examples/             # Usage examples
+    ├── basic_usage.py    # Basic model usage
+    ├── batch_processing.py # Batch processing example
+    └── deterministic_comparison.py # Determinism demonstration
+```
+## Entry 1: Utility Modules Implementation
+
+### Goals
+- Create utilities for handling protein sequences
+- Implement batch processing for performance
+- Ensure all data operations are deterministic
+- Separate different utility functions into logical modules
+
+### Implementation Details
+
+#### 1. Created a structured `utils/` directory:
+- `sequence.py` - Sequence processing utilities
+- `representation.py` - Representation analysis utilities
+- `tensor_utils.py` - TensorFlow-specific utilities
+
+#### 2. Extracted the amino acid encoding functionality (**lines 12-50**) from `unirep.py`
+
+Original code snippet in `unirep.py`
+```python
+# Lines 12 - 26
+aa_to_int = {
+    'M':1, 'R':2, 'H':3, 'K':4, 'D':5, 'E':6, 'S':7, 'T':8, 'N':9, 'Q':10, 'C':11, 
+    'U':12, 'G':13,'P':14, 'A':15, 'V':16, 'I':17, 'F':18, 'Y':19, 'W':20, 'L':21,
+    'O':22, # Pyrrolysine
+    'X':23, # Unknown
+    'Z':23, # Glutamic acid or GLutamine
+    'B':23, # Asparagine or aspartic acid
+    'J':23, # Leucine or isoleucine
+    'start':24, 'stop':25,
+}
+
+# Line 44
+int_to_aa = {value:key for key, value in aa_to_int.items()}
+
+# Line 46 - 50
+def aa_seq_to_int(s):
+    """
+    Return the int sequence as a list for a given string of amino acids
+    """
+    return [24] + [aa_to_int[a] for a in s] + [25]
+
+```
+
+Refactored and enhanced in `utils/sequence.py`
+```python
+# Type-annotated dictionaries
+aa_to_int: Dict[str, int] = {
+    'M': 1, 'R': 2, 'H': 3, 'K': 4, 'D': 5, 'E': 6, 'S': 7, 'T': 8, 'N': 9, 'Q': 10, 'C': 11, 
+    'U': 12, 'G': 13, 'P': 14, 'A': 15, 'V': 16, 'I': 17, 'F': 18, 'Y': 19, 'W': 20, 'L': 21, 
+    'O': 22, # Pyrrolysine
+    'X': 23, # Unkown
+    'Z': 23, # Glutamic acid or GLutamine
+    'B': 23, # Asparagine or aspartic acid
+    'J': 23, # Leucine or isoleucine
+    'start': 24, 'stop': 25,
+}
+
+# Enhanced function with type annotations and options
+def aa_seq_to_int(s: str, include_stop: bool = True) -> List[int]:
+    """
+    Convert an amino acid sequence to integer representation.
+    
+    Args:
+        s: String of amino acid characters
+        include_stop: Whether to include the stop token (default True)
+        
+    Returns:
+        List of integers representing the sequence with start/stop tokens
+    """
+    if include_stop:
+        return [24] + [aa_to_int.get(a, 23) for a in s] + [25]
+    else:
+        return [24] + [aa_to_int.get(a, 23) for a in s]
+```
+
+#### 3. Implement three additional utility methods
+
+`int_to_aa_seq()` decodes integers back to amino acids
+```python
+def int_to_aa_seq(int_seq: List[int], remove_tokens: bool = True) -> str:
+    """
+    Convert an integer representation back to an amino acid sequence.
+    
+    Args:
+        int_seq: List of integers representing the sequence
+        remove_tokens: Whether to remove start/stop tokens
+        
+    Returns:
+        String of amino acid characters
+    """
+    if remove_tokens:
+        # Remove start and stop tokens (usually at positions 0 and -1)
+        if int_seq[0] == 24:  # start token
+            int_seq = int_seq[1:]
+        if int_seq and int_seq[-1] == 25:  # stop token
+            int_seq = int_seq[:-1]
+    
+    return ''.join([int_to_aa.get(i, 'X') for i in int_seq])
+```
+
+`is_valid_seq()` corresponds to a validation check that was in `unirep.py` (**lines 665-674**)
+
+Original code snippet in `unirep.py`
+```python
+# inside babbler1900 class
+# Lines 665-674
+def is_valid_seq(self, seq, max_len=2000):
+    """
+    True if seq is valid for the babbler, False otherwise.
+    """
+    l = len(seq)
+    valid_aas = "MRHKDESTNQCUGPAVIFYWLO"
+    if (l < max_len) and set(seq) <= set(valid_aas):
+        return True
+    else:
+        return False
+```
+
+Extract to a standalone method `is_valid_seq()` with better typing in `sequence.py`
+```python
+def is_valid_seq(seq: str, max_len: int = 2000) -> bool:
+    """
+    Check if a sequence is valid for UniRep processing.
+    
+    Args:
+        seq: String of amino acid characters
+        max_len: Maximum allowed sequence length
+        
+    Returns:
+        Boolean indicating if sequence is valid
+    """
+    valid_aas: Set[str] = set("MRHKDESTNQCUGPAVIFYWLO")
+    return len(seq) < max_len and set(seq).issubset(valid_aas)
+```
+
+Implement coverting a sequence to tensor method `seq_to_tensor()` in `sequence.py`
+```python
+def seq_to_tensor(seq: str, remove_stop: bool = True) -> tf.Tensor:
+    """
+    Convert a sequence to a TensorFlow tensor with batch dimension.
+    
+    Args:
+        seq: Amino acid sequence string
+        remove_stop: Whether to remove the stop token
+        
+    Returns:
+        TensorFlow tensor of sequence integers
+    """
+    if remove_stop:
+        int_seq = aa_seq_to_int(seq.strip())[:-1]
+    else:
+        int_seq = aa_seq_to_int(seq.strip())
+    return tf.convert_to_tensor([int_seq], dtype=tf.int32)
+```
+
+#### 4. Refactored `bucketbatchpad()` (lines 52-94) to `SequenceBatcher()` class
+
+`bucketbatchpad()` is being decoupled and transformed to a class for several reasons:
+- To maintain state across multiple calls (batch size, maximum sequence length, etc.)
+- To group related functionality together (batch processing, FASTA handling, etc.)
+- To have better typing
+- To allow for more flexible configuration options
+
+##### TensorFlow API Change
+Several parameters from the original function required special handling due to TensorFlow API changes:
+1. **Compressed File Handling**: The compressed parameter used with `tf.contrib.data.TextLineDataset` has been updated to use the modern compression_type parameter in **TensorFlow 2.x**'s `tf.data.TextLineDataset`.
+2. **Bucketing Strategy**: The original bucketing approach using `group_by_window` has been replaced with standard padding in the initial implementation, with potential for a future dedicated bucketing method using `tf.data.experimental.bucket_by_sequence_length`.
+3. **Eager Execution**: I removed `initialized_uninitialzied()`since **TensorFlow 2.x** uses eager execution by default, which eliminates the needs for explicit variable initialization that was requried in **TensorFlow 1.x**'s graph mode. Varabiesl are automatically initalized when createed, without explicit call to `session.run`.
+
+Key improvements:
+>1. Function Parameters → Class Constructor
+```python
+def __init__(
+    self, 
+    batch_size: int = 256, 
+    max_seq_len: int = 2000, 
+    include_stop: bool = False, 
+    shuffle: bool = True, 
+    seed: int = 42
+):
+    """
+    Initialize the sequence batcher.
+    
+    Args:
+        batch_size: Number of sequences per batch
+        max_seq_len: Maximum sequence length to process
+        include_stop: Whether to include stop tokens
+        shuffle: Whether to shuffle the data
+        seed: Random seed for reproducible shuffling
+    """
+    self.batch_size: int = batch_size
+    self.max_seq_len: int = max_seq_len
+    self.include_stop: bool = include_stop
+    self.shuffle: bool = shuffle
+    self.seed: int = seed
+```
+- `batch_size` parameter retained with same default (256)
+- `path_to_data` moved to method parameters for greater flexibility
+- `compressed` and `bounds` parameters modernized due to TensorFlow API changes
+- Added `seed` parameter for deterministic behavior
+- Added type annotations for better code safety
+
+>2. Dataset Creation Logic → Method-specific Implementation
+```python
+def batch_pad_sequences(
+    self, sequences: List[str]
+) -> Tuple[tf.Tensor, List[int]]:
+    """
+    Create efficiently batched sequences with padding.
+    
+    Args:
+        sequences: List of amino acid sequences
+        
+    Returns:
+        Padded tensor of shape [batch_size, max_length]
+        List of sequence lengths
+    """
+    # Convert sequences to integer lists
+    int_seqs: List[List[int]] = [
+        aa_seq_to_int(seq.strip(), include_stop=self.include_stop) 
+        for seq in sequences
+    ]
+    
+    # Get sequence lengths
+    seq_lengths: List[int] = [len(seq) for seq in int_seqs]
+    
+    # Determine padding length (dynamic based on batch)
+    pad_len: int = min(max(seq_lengths), self.max_seq_len)
+    
+    # Pad sequences
+    padded_seqs = tf.keras.preprocessing.sequence.pad_sequences(
+        int_seqs, 
+        maxlen=pad_len,
+        padding='post',
+        truncating='post',
+        value=0
+    )
+    
+    return tf.convert_to_tensor(padded_seqs, dtype=tf.int32), seq_lengths
+```
+- Replaced `tf.contrib` APIs with modern **TensorFlow 2.x** equivalents
+- Uses `tf.keras.preprocessing.sequence.pad_sequences` for padding
+- Handles dynamic padding based on actual sequence lengths
+- Returns both padded sequences and length information
+
+>3.Dataset Creation with Modern TensorFlow API
+
+```python
+def create_dataset(
+    self, 
+    sequences: Union[List[str], Dict[str, str]], 
+    repeat: Optional[int] = None
+) -> tf.data.Dataset:
+    """
+    Create a TensorFlow dataset from sequences for efficient processing.
+    
+    Args:
+        sequences: List of amino acid sequences or dict with seq_id:seq pairs
+        repeat: Number of epochs to repeat (None for infinite)
+        
+    Returns:
+        TensorFlow Dataset object
+    """
+    # Handle dictionary input
+    if isinstance(sequences, dict):
+        seq_ids: List[str] = list(sequences.keys())
+        seq_list: List[str] = list(sequences.values())
+    else:
+        seq_ids: List[int] = list(range(len(sequences)))
+        seq_list: List[str] = sequences
+    
+    # Convert sequences to integer lists
+    int_seqs: List[List[int]] = [
+        aa_seq_to_int(seq.strip(), include_stop=self.include_stop) 
+        for seq in seq_list
+    ]
+    
+    # Get sequence lengths
+    seq_lengths: List[int] = [len(seq) for seq in int_seqs]
+    
+    # Create dataset
+    dataset = tf.data.Dataset.from_tensor_slices((
+        seq_ids,
+        int_seqs, 
+        seq_lengths
+    ))
+    
+    # Shuffle if requested
+    if self.shuffle:
+        dataset = dataset.shuffle(
+            buffer_size=min(len(int_seqs), 10000),
+            seed=self.seed,
+            reshuffle_each_iteration=True
+        )
+    
+    # Repeat if requested
+    if repeat is not None:
+        dataset = dataset.repeat(repeat)
+    
+    # Batch and pad
+    padded_shapes = (
+        tf.TensorShape([]),        # seq_id shape
+        tf.TensorShape([None]),    # sequence shape (variable length)
+        tf.TensorShape([])         # length shape
+    )
+    
+    padding_values = (
+        "",   # seq_id padding (not used for string ids)
+        0,    # sequence padding 
+        0     # length padding (not used)
+    )
+    
+    dataset = dataset.padded_batch(
+        self.batch_size,
+        padded_shapes=padded_shapes,
+        padding_values=padding_values
+    )
+    
+    return dataset
+```
+- Updates to modern **TensorFlow 2.x tf.data** API
+- Adds support for both list and dictionary inputs
+- Implements deterministic shuffling with seed
+- Uses proper padding configurations for different tensor types
+
+
+>4.File Processing Enhancement
+```python
+    def process_fasta(self, fasta_path: str) -> Dict[str, str]:
+        """
+        Process a FASTA file into a dictionary of sequences.
+        
+        Args:
+            fasta_path: Path to FASTA file
+            
+        Returns:
+            Dict of sequence_id:sequence pairs
+        """
+        sequences: Dict[str, str] = {}
+
+        for record in SeqIO.parse(fasta_path, "fasta"):
+            seq_id: str = record.id
+            sequence: str = str(record.seq)
+                
+            # Check if sequence is valid
+            if is_valid_seq(sequence, self.max_seq_len):
+                sequences[seq_id] = sequence
+                
+        return sequences
+```
+
+- Added dedicated FASTA file processing
+- Validates sequences during loading
+
+#### 5. Extract `tf_get_shape()` (line 96-101) to `utils/tensor_utils.py`
+
+Original code snippet in `unirep.py`
+```python
+def tf_get_shape(tensor):
+    static_shape = tensor.shape.as_list()
+    dynamic_shape = tf.unstack(tf.shape(tensor))
+    dims = [s[1] if s[0] is None else s[0]
+            for s in zip(static_shape, dynamic_shape)]
+    return dims
+```
+
+Extracted to `utils/tensor_utils.py`
+```python
+def get_tensor_shape(tensor: tf.Tensor) -> List[int]:
+    """
+    Get the shape of a tensor, handling both static and dynamic dimensions.
+    
+    Args:
+        tensor: Input tensor
+        
+    Returns:
+        List of dimension sizes
+    """
+    # Get static shape where available
+    static_shape = tensor.shape.as_list()
+    
+    # Get dynamic shape for dimensions that are None in static shape
+    dynamic_shape = tf.unstack(tf.shape(tensor))
+    
+    # Combine static and dynamic dimensions
+    dims = [s[1] if s[0] is None else s[0] 
+            for s in zip(static_shape, dynamic_shape)]
+    
+    return dims
+```
+
+#### 6. Refactor `sample_with_temp()` (lines 103-111) to `utils/tensor_utils.py`
+
+
+Original code snippet in `unirep.py`
+```python
+def sample_with_temp(logits, t):
+    """
+    Takes temperature between 0 and 1 -> zero most conservative, 1 most liberal. Samples.
+    """
+    t_adjusted = logits / t  # broadcast temperature normalization
+    softed = tf.nn.softmax(t_adjusted)
+    
+    # Make a categorical distribution from the softmax and sample
+    return tf.distributions.Categorical(probs=softed).sample()
+```
+
+Extracted to `utils/tensor_util.py`
+```python
+def sample_with_temperature(
+    logits: tf.Tensor,
+    temperature: float,
+    seed: Optional[int] = None
+    ) -> tf.Tensor: 
+    """
+    Sample from logits with temperature adjustment.
+    
+    Args:
+        logits: Raw logits tensor
+        temperature: Temperature parameter (0-1, lower = more conservative)
+        seed: Random seed for deterministic sampling
+        
+    Returns:
+        Sampled indices tensor
+    """
+    # Adjust logits by temperature
+    scaled_logits = logits / max(temperature, 1e-8)  # Avoid division by zero
+    
+    # Apply softmax to get probabilities
+    probabilities = tf.nn.softmax(scaled_logits, axis=-1)
+    
+    # Sample from categorical distribution (updated for TF 2.x)
+    return tf.random.categorical(
+        tf.math.log(probabilities + 1e-8),  # Add small value to avoid log(0)
+        num_samples=1,
+        seed=seed
+    )
+```
+---
+
+## Entry 2: Configuration Module Implementation
+
+### Goals
+- Create a configuration system that enforces deterministic behavior
+- Handle reproducibility settings across different environments
+- Provide configuration factory functions for different model sizes
+
+### Implementation Details
+
+#### 1. Created `config.py` with a `UniRepConfig` class that
+
+- Sets random seeds for Python, NumPy, and TensorFlow
+- Enables TensorFlow's operation determinism features
+- Configures GPU for deterministic operations
+- Implements memory management for performance
+
+
+#### 2. Added factory functions for different model sizes:
+
+- get_64_config() - For the 64-unit model (4 layers)
+- get_256_config() - For the 256-unit model (4 layers)
+- get_1900_config() - For the 1900-unit model (1 layer)
+
+
+#### 3. Added configuration validation to ensure proper settings
+
+#### 4. Key implementations for deterministic behavior:
+Created a basic test script test_config.py to verify:
+
+- Random number generation is consistent
+- Matrix multiplications are deterministic
+- Embedding lookups are consistent
+
+```python
+def _set_random_seeds(self) -> None:
+    """Set random seeds for Python, NumPy, and TensorFlow."""
+    # Set Python's random seed
+    import random
+    random.seed(self.seed)
+    
+    # Set NumPy's random seed
+    np.random.seed(self.seed)
+    
+    # Set TensorFlow's random seed
+    if hasattr(tf, 'random'):  # TensorFlow 2.x
+        tf.random.set_seed(self.seed)
+    else:  # TensorFlow 1.x fallback
+        tf.set_random_seed(self.seed)
+    
+    # Set PYTHONHASHSEED for global reproducibility
+    os.environ['PYTHONHASHSEED'] = str(self.seed)
+```
+
+#### 5. Added method to configure TensorFlow for deterministic operations:
+```python
+def _configure_deterministic_mode(self) -> None:
+    """Configure TensorFlow for deterministic operations."""
+    if hasattr(tf, 'config'):  # TensorFlow 2.x
+        # Enable operation determinism
+        if hasattr(tf.config.experimental, 'enable_op_determinism'):
+            tf.config.experimental.enable_op_determinism()
+        else:
+            # For older TF 2.x versions
+            os.environ['TF_DETERMINISTIC_OPS'] = '1'
+    else:  # TensorFlow 1.x
+        # Set environment variables for deterministic operations
+        os.environ['TF_DETERMINISTIC_OPS'] = '1'
+```
+
+#### 6. Testing 
+
+Created a basic test script test_config.py to verify:
+- Random number generation is consistent
+- Matrix multiplications are deterministic
+- Embedding lookups are consistent
+
+## Entry 3: Cell Implementation
+### Goals
+- Implement the mLSTM cell in TensorFlow 2.x
+- Ensure all operations are deterministic
+- Maintain compatibility with the original model architecture
+- Create a hierarchical cell structure
+
+### Implementation Details
+
+#### 1. Created a modular cell structure in the `cells/` directory:
+
+- `base_cell.py` - Abstract base class for all cells
+- `mlstm_cell.py` - mLSTM cell implementation
+- `mlstm_stack.py` - Stacked mLSTM implementation
+
+#### 2. Designed BaseCell abstract class in cells/base_cell.py:
+```python
+class BaseCell(tf.keras.layers.Layer, ABC):
+    """Abstract base class for RNN cells with deterministic behavior."""
+    
+    @abstractmethod
+    def call(self, inputs, states, **kwargs):
+        """Process inputs and previous state to produce new state."""
+        pass
+    
+    @abstractmethod
+    def get_initial_state(self, inputs=None, batch_size=None, dtype=None):
+        """Create initial states for the cell."""
+        pass
+```
+
+#### 3. Implemented mLSTMCell in cells/mlstm_cell.py:
+```python
+class mLSTMCell(BaseCell):
+    """mLSTM cell implementation with deterministic behavior."""
+    
+    def __init__(self, units, weight_norm=True, seed=42, 
+                deterministic=True, **kwargs):
+        super(mLSTMCell, self).__init__(**kwargs)
+        self.units = units
+        self.weight_norm = weight_norm
+        self.seed = seed
+        self.deterministic = deterministic
+        # ... initialization code ...
+```
+
+#### 4. Created StackedMLSTMCell in cells/mlstm_stack.py for multi-layer models:
+```python
+class StackedMLSTMCell(BaseCell):
+    """Stacked mLSTM cell implementation for multi-layer models."""
+    
+    def __init__(self, units, num_layers=4, weight_norm=True, 
+                seed=42, deterministic=True, **kwargs):
+        super(StackedMLSTMCell, self).__init__(**kwargs)
+        self.units = units
+        self.num_layers = num_layers
+        self.seed = seed
+        # ... initialization code ...
+```
+
+#### 5. Key deterministic features implemented:
+- Used explicit control over parallel execution
+- Fixed operation order for matrix multiplications
+- Added deterministic gradient accumulation
+- Implemented proper weight initialization with fixed seeds
+- Added explicit control for matrix operations:
+
+```python
+def call(self, inputs, states):
+    # Unpack the state tuple
+    c_prev, h_prev = states
+    
+    # Use deterministic matrix multiplications with fixed operation order
+    with tf.name_scope('multiplicative_connection'):
+        mx = tf.matmul(inputs, self.wmx, name="mx")
+        mh = tf.matmul(h_prev, self.wmh, name="mh")
+        m = mx * mh  # Element-wise multiplication
+    
+    with tf.name_scope('gates'):
+        wx_result = tf.matmul(inputs, self.wx, name="wx_result")
+        wh_result = tf.matmul(m, self.wh, name="wh_result")
+        z = wx_result + wh_result + self.b
+```
