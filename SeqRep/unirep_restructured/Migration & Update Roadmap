@@ -764,162 +764,497 @@ Sequence padding check - Actual: True
 
 ---
 
-## Entry 2: Configuration Module Implementation
+## Entry 2: LSTM Cell Implementation
 
 ### Goals
-- Create a configuration system that enforces deterministic behavior
-- Handle reproducibility settings across different environments
-- Provide configuration factory functions for different model sizes
+- Refactor the LSTM cell implementations from TensorFlow 1.3 to 2.x API
+- Implement deterministic behavior
+- Create a clear class hierarchy
+- Maintain compatibility with original model weights
 
 ### Implementation Details
 
-#### 1. Created `config.py` with a `UniRepConfig` class that
+#### 1. Base LSTM Cell Extraction & Refactoring
 
-- Sets random seeds for Python, NumPy, and TensorFlow
-- Enables TensorFlow's operation determinism features
-- Configures GPU for deterministic operations
-- Implements memory management for performance
+Original code in `unirep.py` contains two LSTM cell variants and one stack implementation:
+1. `mLSTMCell1900` (**lines 125-207**) : a fixed-size multiplicative LSTM cell with 1900 units
+2. `mLSTMCell` (**lines 209-399**) - a configurable multiplicative LSTM cell with customizable initialization. 
+3. `mLSTMCellStackNPY` (**lines 301-390**): Stack of mLSTM cells for deep networks
 
-
-#### 2. Added factory functions for different model sizes:
-
-- get_64_config() - For the 64-unit model (4 layers)
-- get_256_config() - For the 256-unit model (4 layers)
-- get_1900_config() - For the 1900-unit model (1 layer)
-
-
-#### 3. Added configuration validation to ensure proper settings
-
-#### 4. Key implementations for deterministic behavior:
-Created a basic test script test_config.py to verify:
-
-- Random number generation is consistent
-- Matrix multiplications are deterministic
-- Embedding lookups are consistent
+A base LSTM cell class, `BaseLSTMCell`, was created in `cells/base_cell.py` to serve as the foundation for all specialized LSTM implementations. Specifically, this is to generalize a RNN cell structure from `mLSTMCell` and `mLSTMCell1900` from `unirep.py` and abstracts common functionality from the original classes.
 
 ```python
-def _set_random_seeds(self) -> None:
-    """Set random seeds for Python, NumPy, and TensorFlow."""
-    # Set Python's random seed
-    import random
-    random.seed(self.seed)
-    
-    # Set NumPy's random seed
-    np.random.seed(self.seed)
-    
-    # Set TensorFlow's random seed
-    if hasattr(tf, 'random'):  # TensorFlow 2.x
-        tf.random.set_seed(self.seed)
-    else:  # TensorFlow 1.x fallback
-        tf.set_random_seed(self.seed)
-    
-    # Set PYTHONHASHSEED for global reproducibility
-    os.environ['PYTHONHASHSEED'] = str(self.seed)
+class BaseLSTMCell(tf.keras.layers.Layer):
+    def __init__(
+    self,
+    num_units: int,
+    weight_norm: bool = True,
+    name: str = "base_lstm",
+    **kwargs: Any
+):
 ```
 
-#### 5. Added method to configure TensorFlow for deterministic operations:
+The `BaseLSTMCell` constructor parameters were derived from analysis of the original implementations
+
+- `num_units`:  represents the size of cell's hidden state. Originally used in both `mLSTMCell1900` (**line 127**) and `mLSTMCell` (**line 212**) 
+- `weight_norm`: controls whether weight normalization is applied. Corresponds to `wn` in the original code (**lines 129** and **222**)
+- `name`: replaces `scope` from the original (**lines 130** and **223**) to align with TensorFlow 2.x Keras layer naming conventions
+- `**kwargs`: added to support future extensibility and Keras layer configuration options
+
+Extracted common patterns into `BaseLSTMCell` in `cells/base_cell.py`:
+
+| Original Feature | Original Location | Refactored Implementation |
+|------------------|-------------------|---------------------------|
+| State size property | Lines 141-144, 242-245 | `state_size` property |
+| Output size property | Lines 146-149, 247-250 | `output_size` property |
+| Zero state creation | Lines 151-154, 252-255 | `get_initial_state()` method |
+| Weight normalization | Lines 193-197, 285-289 | `apply_weight_norm()` method |
+
+Refactored implementations have better type annotation, and updated return types to match TensorFlow 2.x expectations. 
+
+Example: refactored `state_size` and  `output_size` properties 
+
 ```python
-def _configure_deterministic_mode(self) -> None:
-    """Configure TensorFlow for deterministic operations."""
-    if hasattr(tf, 'config'):  # TensorFlow 2.x
-        # Enable operation determinism
-        if hasattr(tf.config.experimental, 'enable_op_determinism'):
-            tf.config.experimental.enable_op_determinism()
-        else:
-            # For older TF 2.x versions
-            os.environ['TF_DETERMINISTIC_OPS'] = '1'
-    else:  # TensorFlow 1.x
-        # Set environment variables for deterministic operations
-        os.environ['TF_DETERMINISTIC_OPS'] = '1'
+@property
+def state_size(self) -> Tuple[tf.TensorShape, tf.TensorShape]:
+	"""Return size of cell and hidden states."""
+    return (tf.TensorShape([self._num_units]), tf.TensorShape([self._num_units]))
+    
+@property
+def output_size(self) -> tf.TensorShape:
+    """Return size of output (hidden state)."""
+    return tf.TensorShape([self._num_units])
 ```
 
-#### 6. Testing 
+**Key TensorFlow API Changes** 
 
-Created a basic test script test_config.py to verify:
-- Random number generation is consistent
-- Matrix multiplications are deterministic
-- Embedding lookups are consistent
+- Class inheritance: replace `tf.nn.rnn_ce ll.RNNCell` with `tf.keras.layers.Layer` 
+- Dimension arguments: replace`dim=0` with `axis=0` 
+- State initialization: `zero_state()` → `get_initial_state()`
 
-## Entry 3: Cell Implementation
-### Goals
-- Implement the mLSTM cell in TensorFlow 2.x
-- Ensure all operations are deterministic
-- Maintain compatibility with the original model architecture
-- Create a hierarchical cell structure
+Added **New Methods for Deterministic Behavior**:
 
-### Implementation Details
+- `deterministic_reduce_mean()`: Ensures consistent reduction operations on GPU 
+- `set_seed()`: Standardizes random seed setting for reproducibility
 
-#### 1. Created a modular cell structure in the `cells/` directory:
+Added **New Method Structure for TensorFlow 2.x Compatibility**:
 
-- `base_cell.py` - Abstract base class for all cells
-- `mlstm_cell.py` - mLSTM cell implementation
-- `mlstm_stack.py` - Stacked mLSTM implementation
+1. **`build(input_shape)`**:   
+   - Required by TensorFlow 2.x Keras layer API   
+   - Called once before the first forward pass to initialize weights   
+   - Dynamically creates weight variables based on input dimensions   
+   - Creates a clear separation between weight initialization and computation
+2. **`call(inputs, states, training=None)`**:
+   - Core computation method in TensorFlow 2.x
+   - Replaces the old RNNCell's `__call__` pattern
+   - Adds `training` parameter for dropout/normalization behavior
+   - Abstract method in the base class, must be implemented by subclasses
 
-#### 2. Designed BaseCell abstract class in cells/base_cell.py:
 ```python
-class BaseCell(tf.keras.layers.Layer, ABC):
-    """Abstract base class for RNN cells with deterministic behavior."""
+def build(self, input_shape: tf.TensorShape) -> None:
+    """
+    Build the cell weights based on input shape.
+    This method should be overridden by subclasses to create weights.
+    Args:
+    	input_shape: Shape of the input tensor
+    """
+    # Base implementation just calls parent's build method
+    super(BaseLSTMCell, self).build(input_shape)
     
-    @abstractmethod
-    def call(self, inputs, states, **kwargs):
-        """Process inputs and previous state to produce new state."""
-        pass
+def call(
+    self, 
+    inputs: tf.Tensor, 
+    states: Tuple[tf.Tensor, tf.Tensor],
+    training: Optional[bool]=None) -> Tuple[tf.Tensor, Tuple[tf.Tensor, tf.Tensor]]:
+    """
+    Run one step of the LSTM cell.
+    This method must be implemented by subclasses.
     
-    @abstractmethod
-    def get_initial_state(self, inputs=None, batch_size=None, dtype=None):
-        """Create initial states for the cell."""
-        pass
+    Args:
+    	inputs: Input tensor of shape [batch_size, input_dim]
+    	states: Tuple of (cell_state, hidden_state)
+    	training: Whether in training mode
+    Returns:
+    	Tuple of (output, next_state)
+    """
+    raise NotImplementedError("BaseLSTMCell is an abstract class. Subclasses must implement call().")
 ```
 
-#### 3. Implemented mLSTMCell in cells/mlstm_cell.py:
+**Note**: Several utility methods were considered for the base cell implementation but were deprioritized to focus on core functionality:
+
+- Weight initialization helpers (orthogonal and ones initializers)
+- Weight persistence methods (save/load to NumPy files)
+
+These methods may be implemented in specific cell subclasses as needed.
+
+#### 2. Implement mLSTM Cell
+
+In the original code, the `mLSTMCell` class (**lines 209-299**) implements a configurable multiplicative LSTM cell with customizable initialization. This cell forms the core of the UniRep model's sequence processing capabilities. Our refactoring focuses on updating to TensorFlow 2.x while maintaining the exact same mathematical operations.
+
+The original constructor (**lines 209-226**) contained many individual initializers and configuration parameters:
+
 ```python
-class mLSTMCell(BaseCell):
-    """mLSTM cell implementation with deterministic behavior."""
-    
-    def __init__(self, units, weight_norm=True, seed=42, 
-                deterministic=True, **kwargs):
-        super(mLSTMCell, self).__init__(**kwargs)
-        self.units = units
-        self.weight_norm = weight_norm
-        self.seed = seed
-        self.deterministic = deterministic
-        # ... initialization code ...
+# Original code (unirep.py, lines 209-226)
+class mLSTMCell(tf.nn.rnn_cell.RNNCell):
+    def __init__(self,
+                 num_units,
+                 wx_init=tf.orthogonal_initializer(),
+                 wh_init=tf.orthogonal_initializer(),
+                 wmx_init=tf.orthogonal_initializer(),
+                 wmh_init=tf.orthogonal_initializer(),
+                 b_init=tf.orthogonal_initializer(),
+                 gx_init=tf.ones_initializer(),
+                 gh_init=tf.ones_initializer(),
+                 gmx_init=tf.ones_initializer(),
+                 gmh_init=tf.ones_initializer(),
+                 wn=True,
+                 scope='mlstm',
+                 var_device='cpu:0'):
+        super(mLSTMCell, self).__init__()
+        self._num_units = num_units
+        self._wn = wn
+        self._scope = scope
+        self._var_device = var_device
+        # ... stores initializers as instance variables
 ```
 
-#### 4. Created StackedMLSTMCell in cells/mlstm_stack.py for multi-layer models:
+Our refactored constructor is streamlined to leverage the `BaseLSTMCell` parent class and focus on the unique aspects of the mLSTM cell
+
+- Added `seed` parameter for deterministic behavior
+- Removed device placement parameter (`var_device`) as this is handled differently in TensorFlow 2.x
+- Renamed parameters for clarity (`wn` → `weight_norm`, `scope` → `name`)
+- Added type annotations for better code safety
+
 ```python
-class StackedMLSTMCell(BaseCell):
-    """Stacked mLSTM cell implementation for multi-layer models."""
-    
-    def __init__(self, units, num_layers=4, weight_norm=True, 
-                seed=42, deterministic=True, **kwargs):
-        super(StackedMLSTMCell, self).__init__(**kwargs)
-        self.units = units
-        self.num_layers = num_layers
-        self.seed = seed
-        # ... initialization code ...
+# cells/mlstm_cell.py
+class mLSTMCell(BaseLSTMCell):
+    def __init__(
+        self,
+        num_units: int,
+        weight_norm: bool = True,
+        seed: Optional[int] = None,
+        name: str = "mlstm",
+        **kwargs: Any
+    ):
+        """
+        Initialize mLSTMCell with configuration.
+        
+        Args:
+            num_units: Number of units in the LSTM cell
+            weight_norm: Whether to use weight normalization
+            seed: Random seed for deterministic behavior
+            name: Name of the cell
+        """
+        super(mLSTMCell, self).__init__(
+            num_units=num_units, 
+            weight_norm=weight_norm,
+            name=name,
+            **kwargs
+        )
+        self._seed = seed
+        self.set_seed(seed)
 ```
 
-#### 5. Key deterministic features implemented:
-- Used explicit control over parallel execution
-- Fixed operation order for matrix multiplications
-- Added deterministic gradient accumulation
-- Implemented proper weight initialization with fixed seeds
-- Added explicit control for matrix operations:
+For **weight initialization**, the original code in `unirep.py` used `tf.get_variable()` with initializers for each weight (**lines 264-283**). 
 
 ```python
-def call(self, inputs, states):
-    # Unpack the state tuple
+with tf.variable_scope(self._scope):
+    wx = tf.get_variable(
+        "wx", initializer=self._wx_init)
+    wh = tf.get_variable(
+        "wh", initializer=self._wh_init)
+    wmx = tf.get_variable(
+        "wmx", initializer=self._wmx_init)
+    wmh = tf.get_variable(
+        "wmh", initializer=self._wmh_init)
+    b = tf.get_variable(
+        "b", initializer=self._b_init)
+    if self._wn:
+        gx = tf.get_variable(
+            "gx", initializer=self._gx_init)
+        gh = tf.get_variable(
+            "gh", initializer=self._gh_init)
+        gmx = tf.get_variable(
+            "gmx", initializer=self._gmx_init)
+        gmh = tf.get_variable(
+            "gmh", initializer=self._gmh_init)
+```
+
+In TensorFlow 2.x, we use the `build()` method to create weights: 
+
+- Added explicit `seed` parameter for deterministic initialization
+
+- Use `self.add_weight()` instead of `tf.get_variable()`
+
+- Dynamically determine input dimension from `input_shape` parameter
+
+- Set `self.built = True` to signal that the layer is built
+
+```python
+def build(self, input_shape: tf.TensorShape) -> None:
+    """
+    Build the cell weights based on input shape.
+    
+    Args:
+        input_shape: Shape of the input tensor [batch_size, input_dim]
+    """
+    input_dim = input_shape[-1]
+    
+    # Create weight initializers
+    ortho_init = tf.initializers.orthogonal(seed=self._seed)
+    ones_init = tf.ones_initializer()
+    
+    # Input weights
+    self.wx = self.add_weight(
+        name="wx",
+        shape=[input_dim, self._num_units * 4],
+        initializer=ortho_init
+    )
+    
+    # Hidden weights
+    self.wh = self.add_weight(
+        name="wh",
+        shape=[self._num_units, self._num_units * 4],
+        initializer=ortho_init
+    )
+    
+    # Multiplicative weights for input
+    self.wmx = self.add_weight(
+        name="wmx",
+        shape=[input_dim, self._num_units],
+        initializer=ortho_init
+    )
+    
+    # Multiplicative weights for hidden
+    self.wmh = self.add_weight(
+        name="wmh",
+        shape=[self._num_units, self._num_units],
+        initializer=ortho_init
+    )
+    
+    # Bias
+    self.b = self.add_weight(
+        name="b",
+        shape=[self._num_units * 4],
+        initializer=tf.zeros_initializer()
+    )
+    
+    # Gain parameters for weight normalization
+    if self._weight_norm:
+        self.gx = self.add_weight(
+            name="gx",
+            shape=[self._num_units * 4],
+            initializer=ones_init
+        )
+        
+        self.gh = self.add_weight(
+            name="gh",
+            shape=[self._num_units * 4],
+            initializer=ones_init
+        )
+        
+        self.gmx = self.add_weight(
+            name="gmx",
+            shape=[self._num_units],
+            initializer=ones_init
+        )
+        
+        self.gmh = self.add_weight(
+            name="gmh",
+            shape=[self._num_units],
+            initializer=ones_init
+        )
+    
+    self.built = True
+```
+
+For **cell computation**, the original code in `unirep.py` implemented the core mLSTM computation in the `call()` method (**lines 290-298**). 
+
+```python
+ m = tf.matmul(inputs, wmx) * tf.matmul(h_prev, wmh)
+        z = tf.matmul(inputs, wx) + tf.matmul(m, wh) + b
+        i, f, o, u = tf.split(z, 4, 1)
+        i = tf.nn.sigmoid(i)
+        f = tf.nn.sigmoid(f)
+        o = tf.nn.sigmoid(o)
+        u = tf.tanh(u)
+        c = f * c_prev + i * u
+        h = o * tf.tanh(c)
+```
+
+We refactor this to use TensorFlow 2.x API by: 
+
+- Updated parameter signature to include `training` parameter
+
+- Improved type annotations for better code safety
+
+- Updated `tf.split()` to use `axis` parameter instead of positional argument
+
+- Added more detailed comments to explain each step of the computation
+
+```python
+def call(
+    self, 
+    inputs: tf.Tensor, 
+    states: Tuple[tf.Tensor, tf.Tensor], 
+    training: Optional[bool] = None
+) -> Tuple[tf.Tensor, Tuple[tf.Tensor, tf.Tensor]]:
+    """
+    Run one step of the mLSTM cell.
+    
+    Args:
+        inputs: Input tensor of shape [batch_size, input_dim]
+        states: Tuple of (cell_state, hidden_state)
+        training: Whether in training mode
+        
+    Returns:
+        Tuple of (output, next_state)
+    """
+    # Unpack states
     c_prev, h_prev = states
     
-    # Use deterministic matrix multiplications with fixed operation order
-    with tf.name_scope('multiplicative_connection'):
-        mx = tf.matmul(inputs, self.wmx, name="mx")
-        mh = tf.matmul(h_prev, self.wmh, name="mh")
-        m = mx * mh  # Element-wise multiplication
+    # Apply weight normalization if enabled
+    if self._weight_norm:
+        wx = self.apply_weight_norm(self.wx, self.gx)
+        wh = self.apply_weight_norm(self.wh, self.gh)
+        wmx = self.apply_weight_norm(self.wmx, self.gmx)
+        wmh = self.apply_weight_norm(self.wmh, self.gmh)
+    else:
+        wx = self.wx
+        wh = self.wh
+        wmx = self.wmx
+        wmh = self.wmh
     
-    with tf.name_scope('gates'):
-        wx_result = tf.matmul(inputs, self.wx, name="wx_result")
-        wh_result = tf.matmul(m, self.wh, name="wh_result")
-        z = wx_result + wh_result + self.b
+    # Multiplicative interaction
+    m = tf.matmul(inputs, wmx) * tf.matmul(h_prev, wmh)
+    
+    # Input, forget, output, and cell gates
+    z = tf.matmul(inputs, wx) + tf.matmul(m, wh) + self.b
+    i, f, o, u = tf.split(z, 4, axis=1)
+    
+    # Apply activation functions
+    i = tf.nn.sigmoid(i)  # Input gate
+    f = tf.nn.sigmoid(f)  # Forget gate
+    o = tf.nn.sigmoid(o)  # Output gate
+    u = tf.tanh(u)        # Cell update
+    
+    # Update cell state
+    c = f * c_prev + i * u
+    
+    # Update hidden state
+    h = o * tf.tanh(c)
+    
+    return h, (c, h)
 ```
+
+For **weight loading**, oo maintain compatibility with the original model weights, we implement a method to load weights from `NumPy` files:
+
+```python
+def load_weights_from_numpy(self, load_path: str) -> None:
+    """
+    Load cell weights from numpy files.
+    
+    Args:
+        load_path: Directory containing weight files
+    """
+    if not self.built:
+        raise ValueError("Cell must be built before loading weights")
+        
+    # Helper to load weights
+    def load_weight(name: str, var: tf.Variable) -> None:
+        weight_file = os.path.join(load_path, f"{name}.npy")
+        if os.path.exists(weight_file):
+            weight_data = np.load(weight_file)
+            var.assign(weight_data)
+        else:
+            print(f"Warning: Weight file {weight_file} not found")
+    
+    # Load all weights
+    load_weight("rnn_mlstm_mlstm_wx:0", self.wx)
+    load_weight("rnn_mlstm_mlstm_wh:0", self.wh)
+    load_weight("rnn_mlstm_mlstm_wmx:0", self.wmx)
+    load_weight("rnn_mlstm_mlstm_wmh:0", self.wmh)
+    load_weight("rnn_mlstm_mlstm_b:0", self.b)
+    
+    if self._weight_norm:
+        load_weight("rnn_mlstm_mlstm_gx:0", self.gx)
+        load_weight("rnn_mlstm_mlstm_gh:0", self.gh)
+        load_weight("rnn_mlstm_mlstm_gmx:0", self.gmx)
+        load_weight("rnn_mlstm_mlstm_gmh:0", self.gmh)
+```
+
+**Key TensorFlow API Changes**
+
+| Feature | TensorFlow 1.x | TensorFlow 2.x | Impact |
+|---------|---------------|----------------|--------|
+| **Weight Creation** | `tf.get_variable("wx", initializer=wx_init)` | `self.add_weight(name="wx", shape=[...], initializer=...)` | Requires explicit shape specification |
+| **Variable Scope** | `with tf.variable_scope(self._scope):` | Layer-based hierarchy with `name` parameter | Simplified variable organization |
+| **Weight Normalization** | `tf.nn.l2_normalize(wx, dim=0)` | `tf.nn.l2_normalize(wx, axis=0)` | Parameter name change |
+| **Tensor Splitting** | `tf.split(z, 4, 1)` | `tf.split(z, 4, axis=1)` | More explicit parameter naming |
+| **Class Inheritance** | `tf.nn.rnn_cell.RNNCell` | `tf.keras.layers.Layer` | Aligns with Keras API |
+| **Build Pattern** | Variables created in `call()` | Variables created in `build()` | Better separation of initialization and computation |
+| **State Management** | `zero_state(batch_size, dtype)` | `get_initial_state(inputs, batch_size, dtype)` | More flexible state initialization |
+| **Training Mode** | Not explicitly supported | `training` parameter in `call()` | Supports training-specific behaviors |
+| **Initialization Seeding** | Global via `tf.set_random_seed()` | Per-operation via initializer seeds | Better control over randomness |
+| **Parameter Naming** | Often used positional parameters | Requires named parameters | More explicit, less error-prone |
+| **Categorical Sampling** | `tf.distributions.Categorical()` | `tf.random.categorical()` | API reorganization |
+
+
+### Explanation 
+
+The multiplicative LSTM (mLSTM) combines the benefits of LSTM cells with multiplicative RNN dynamics, allowing for stronger expressivity in sequence modeling. Here's how it works:
+
+1. Standard LSTM Components:
+
+   - Cell state (c) - Long-term memory
+
+   - Hidden state (h) - Current output
+   - Gates: input (i), forget (f), output (o), and cell update (u)
+
+2. Multiplicative Enhancement:
+
+   - Before applying the standard LSTM computation, mLSTM introduces a multiplicative interaction between the input and previous hidden state
+   - This creates a tensor product that allows for stronger, non-linear dependencies
+
+3. Core Computation:
+
+   - Multiplicative interaction: `m = (inputs · wmx) * (h_prev · wmh)`
+   - Combined input: `z = (inputs · wx) + (m · wh) + b`
+   - Gate activation: Split z into i, f, o, u and apply activation functions
+   - Cell update: `c = f * c_prev + i * u`
+   - Hidden update: `h = o * tanh(c)`
+
+This architecture is particularly effective for protein sequences because:
+
+- The multiplicative interaction captures complex dependencies between amino acids
+- The cell state maintains information over long sequences
+- The architecture can model diverse structural and functional patterns in **proteins**
+
+#### 4. Stacked mLSTM Cell Implementation
+
+In the original implementation, `mLSTMCellStackNPY` (**lines 301-390**) creates a stack of mLSTM cells with residual connections and dropout support. We refactor this to work with our new cell architecture and the TensorFlow 2.x API.
+
+The stacked mLSTM cell creates a vertical stack of individual mLSTM cells where:
+
+- Each cell processes the output from the previous cell
+- State information is maintained separately for each layer
+- Optional residual connections allow information to skip layers
+- Dropout can be applied between layers during training
+
+This completes our cell architecture implementation, making us ready to move to the model level in Entry 3.
+
+### Explanation 
+
+### mLSTM Cell Architecture
+
+The multiplicative Long Short-Term Memory (mLSTM) cell is a powerful variation of the standard LSTM that introduces multiplicative interactions. Let's explain how it works:
+
+#### Basic Components
+
+1. **Input (x)**: The current input to the cell
+2. **Hidden State (h)**: The previous output of the cell
+3. **Cell State (c)**: The internal memory of the cell
+
+
+
+## Entry 3: Refactor UniRep 64 Unit Model
