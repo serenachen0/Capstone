@@ -193,10 +193,20 @@ class SequenceBatcher:
         # Get sequence lengths
         seq_lengths: List[int] = [len(seq) for seq in int_seqs]
         
-        # Create dataset
+        # Pre-pad all sequences to the maximum length in this dataset
+        max_len = min(max(seq_lengths), self.max_seq_len)
+        padded_seqs = tf.keras.preprocessing.sequence.pad_sequences(
+            int_seqs, 
+            maxlen=max_len,
+            padding='post',
+            truncating='post',
+            value=0
+        )
+
+        # Create dataset with pre-padded sequences
         dataset = tf.data.Dataset.from_tensor_slices((
             seq_ids,
-            int_seqs, 
+            padded_seqs,
             seq_lengths
         ))
         
@@ -213,24 +223,8 @@ class SequenceBatcher:
             dataset = dataset.repeat(repeat)
         
         # Batch and pad
-        padded_shapes = (
-            tf.TensorShape([]),        # seq_id shape
-            tf.TensorShape([None]),    # sequence shape (variable length)
-            tf.TensorShape([])         # length shape
-        )
-        
-        padding_values = (
-            "",   # seq_id padding (not used for string ids)
-            0,    # sequence padding 
-            0     # length padding (not used)
-        )
-        
-        dataset = dataset.padded_batch(
-            self.batch_size,
-            padded_shapes=padded_shapes,
-            padding_values=padding_values
-        )
-        
+        dataset = dataset.padded_batch(self.batch_size)
+    
         return dataset
     
     def process_fasta(self, fasta_path: str) -> Dict[str, str]:

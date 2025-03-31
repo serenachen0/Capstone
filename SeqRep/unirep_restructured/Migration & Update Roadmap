@@ -89,9 +89,9 @@ unirep/
 ### Implementation Details
 
 #### 1. Created a structured `utils/` directory:
-- `sequence.py` - Sequence processing utilities
+- `sequence.py` - Sequence processing utilities :white_check_mark:
 - `representation.py` - Representation analysis utilities
-- `tensor_utils.py` - TensorFlow-specific utilities
+- `tensor_utils.py` - TensorFlow-specific utilities :white_check_mark:
 
 #### 2. Extracted the amino acid encoding functionality (**lines 12-50**) from `unirep.py`
 
@@ -245,7 +245,9 @@ def seq_to_tensor(seq: str, remove_stop: bool = True) -> tf.Tensor:
 Several parameters from the original function required special handling due to TensorFlow API changes:
 1. **Compressed File Handling**: The compressed parameter used with `tf.contrib.data.TextLineDataset` has been updated to use the modern compression_type parameter in **TensorFlow 2.x**'s `tf.data.TextLineDataset`.
 2. **Bucketing Strategy**: The original bucketing approach using `group_by_window` has been replaced with standard padding in the initial implementation, with potential for a future dedicated bucketing method using `tf.data.experimental.bucket_by_sequence_length`.
-3. **Eager Execution**: I removed `initialized_uninitialzied()`since **TensorFlow 2.x** uses eager execution by default, which eliminates the needs for explicit variable initialization that was requried in **TensorFlow 1.x**'s graph mode. Varabiesl are automatically initalized when createed, without explicit call to `session.run`.
+3. **Eager Execution**[^1]: I removed `initialized_uninitialzied()`since **TensorFlow 2.x** uses eager execution by default, which eliminates the needs for explicit variable initialization that was requried in **TensorFlow 1.x**'s graph mode. Varabiesl are automatically initalized when createed, without explicit call to `session.run`.
+
+[^1]: Tensorflow's immediate evaluation mode where operations are executed as they're called, without first building a computational graph. It became the default execution model in TensorFlow 2.x, replacing the graph-based execution model of TensorFlow 1.x. It eliminates the needs for explicit variable initialization that was required in the original code, removing calls to `session.run(tf.global_variables_initializer())`, removing session management, and provides different mechanisms for ensuring reproducible results. 
 
 Key improvements:
 >1. Function Parameters → Class Constructor
@@ -327,76 +329,70 @@ def batch_pad_sequences(
 
 ```python
 def create_dataset(
-    self, 
-    sequences: Union[List[str], Dict[str, str]], 
-    repeat: Optional[int] = None
-) -> tf.data.Dataset:
-    """
-    Create a TensorFlow dataset from sequences for efficient processing.
-    
-    Args:
-        sequences: List of amino acid sequences or dict with seq_id:seq pairs
-        repeat: Number of epochs to repeat (None for infinite)
+        self, 
+        sequences: Union[List[str], Dict[str, str]], 
+        repeat: Optional[int] = None
+    ) -> tf.data.Dataset:
+        """
+        Create a TensorFlow dataset from sequences for efficient processing.
         
-    Returns:
-        TensorFlow Dataset object
-    """
-    # Handle dictionary input
-    if isinstance(sequences, dict):
-        seq_ids: List[str] = list(sequences.keys())
-        seq_list: List[str] = list(sequences.values())
-    else:
-        seq_ids: List[int] = list(range(len(sequences)))
-        seq_list: List[str] = sequences
-    
-    # Convert sequences to integer lists
-    int_seqs: List[List[int]] = [
-        aa_seq_to_int(seq.strip(), include_stop=self.include_stop) 
-        for seq in seq_list
-    ]
-    
-    # Get sequence lengths
-    seq_lengths: List[int] = [len(seq) for seq in int_seqs]
-    
-    # Create dataset
-    dataset = tf.data.Dataset.from_tensor_slices((
-        seq_ids,
-        int_seqs, 
-        seq_lengths
-    ))
-    
-    # Shuffle if requested
-    if self.shuffle:
-        dataset = dataset.shuffle(
-            buffer_size=min(len(int_seqs), 10000),
-            seed=self.seed,
-            reshuffle_each_iteration=True
+        Args:
+            sequences: List of amino acid sequences or dict with seq_id:seq pairs
+            repeat: Number of epochs to repeat (None for infinite)
+            
+        Returns:
+            TensorFlow Dataset object
+        """
+        # Handle dictionary input
+        if isinstance(sequences, dict):
+            seq_ids: List[str] = list(sequences.keys())
+            seq_list: List[str] = list(sequences.values())
+        else:
+            seq_ids: List[int] = list(range(len(sequences)))
+            seq_list: List[str] = sequences
+        
+        # Convert sequences to integer lists
+        int_seqs: List[List[int]] = [
+            aa_seq_to_int(seq.strip(), include_stop=self.include_stop) 
+            for seq in seq_list
+        ]
+        
+        # Get sequence lengths
+        seq_lengths: List[int] = [len(seq) for seq in int_seqs]
+        
+        # Pre-pad all sequences to the maximum length in this dataset
+        max_len = min(max(seq_lengths), self.max_seq_len)
+        padded_seqs = tf.keras.preprocessing.sequence.pad_sequences(
+            int_seqs, 
+            maxlen=max_len,
+            padding='post',
+            truncating='post',
+            value=0
         )
+
+        # Create dataset with pre-padded sequences
+        dataset = tf.data.Dataset.from_tensor_slices((
+            seq_ids,
+            padded_seqs,
+            seq_lengths
+        ))
+        
+        # Shuffle if requested
+        if self.shuffle:
+            dataset = dataset.shuffle(
+                buffer_size=min(len(int_seqs), 10000),
+                seed=self.seed,
+                reshuffle_each_iteration=True
+            )
+        
+        # Repeat if requested
+        if repeat is not None:
+            dataset = dataset.repeat(repeat)
+        
+        # Batch and pad
+        dataset = dataset.padded_batch(self.batch_size)
     
-    # Repeat if requested
-    if repeat is not None:
-        dataset = dataset.repeat(repeat)
-    
-    # Batch and pad
-    padded_shapes = (
-        tf.TensorShape([]),        # seq_id shape
-        tf.TensorShape([None]),    # sequence shape (variable length)
-        tf.TensorShape([])         # length shape
-    )
-    
-    padding_values = (
-        "",   # seq_id padding (not used for string ids)
-        0,    # sequence padding 
-        0     # length padding (not used)
-    )
-    
-    dataset = dataset.padded_batch(
-        self.batch_size,
-        padded_shapes=padded_shapes,
-        padding_values=padding_values
-    )
-    
-    return dataset
+        return dataset
 ```
 - Updates to modern **TensorFlow 2.x tf.data** API
 - Adds support for both list and dictionary inputs
@@ -516,6 +512,256 @@ def sample_with_temperature(
         seed=seed
     )
 ```
+
+### Explanantion with Examples
+
+Since UniRep uses mLSTM architecture, we need to convert the amino acid sequences (strings of letters) into numerical representations that neural networks can process.
+
+Suppose our example sequences are: 
+```
+sequences = [
+    "MGKV",         # Sequence 1
+    "ACDEFGH",      # Sequence 2
+    "STPQR"         # Sequence 3
+]
+```
+
+The sequences will go through the following pre-processing steps:
+
+#### Step 1: Validate the sequence
+
+The code checks if all characters in the sequence are valid amino acids using the `is_valid_seq` function:
+
+```python
+def is_valid_seq(seq: str, max_len: int = 2000) -> bool:
+    valid_aas: Set[str] = set("MRHKDESTNQCUGPAVIFYWLO")
+    return len(seq) < max_len and set(seq).issubset(valid_aas)
+```
+
+For our examples:
+```python
+is_valid_seq("MGKV")     # Returns True
+is_valid_seq("ACDEFGH")  # Returns True
+is_valid_seq("STPQR")    # Returns True
+```
+
+#### Step 2: Convert amino acids to integers
+
+The code maps each amino acid to a unique integer using the `aa_to_int` dictionary:
+
+```python
+aa_to_int: Dict[str, int] = {
+    'M': 1, 'R': 2, 'H': 3, 'K': 4, 'D': 5, 'E': 6, 'S': 7, 'T': 8, 'N': 9, 'Q': 10, 'C': 11, 
+    'U': 12, 'G': 13, 'P': 14, 'A': 15, 'V': 16, 'I': 17, 'F': 18, 'Y': 19, 'W': 20, 'L': 21, 
+    'O': 22, # Pyrrolysine
+    'X': 23, # Unknown
+    'Z': 23, # Glutamic acid or Glutamine
+    'B': 23, # Asparagine or aspartic acid
+    'J': 23, # Leucine or isoleucine
+    'start': 24, 'stop': 25,
+}
+```
+
+For our example:
+```
+"MGKV" → [1, 13, 4, 16]
+"ACDEFGH" → [15, 11, 5, 6, 18, 13, 8]
+"STPQR" → [7, 8, 14, 10, 2]
+```
+
+#### Step 3: Add start and stop tokens
+
+Adding `start` and `stop` tokens in RNN-based models serve as crucial sequence boundary markers that help the model understand where meaningful data begins and ends. For protein sequences, these tokens (represented as integers 24 and 25) enable the model to recognize the natural N-terminus and C-terminus of proteins while providing the hidden state a chance to "warm up" before processing the actual sequence. This approach creates more consistent fixed-size representations across variable-length sequences, improves position-specific learning, and provides a mechanism for controlled sequence generation by signaling when to terminate the output. These special markers are fundamental to effective sequence modeling regardless of whether using LSTMs (as in UniRep) or other architectures.
+
+The `aa_seq_to_int` function adds start and optionally stop tokens to the sequence:
+
+```python
+def aa_seq_to_int(s: str, include_stop: bool = True) -> List[int]:
+    if include_stop:
+        return [24] + [aa_to_int.get(a, 23) for a in s] + [25]
+    else:
+        return [24] + [aa_to_int.get(a, 23) for a in s]
+```
+
+For our examples with `include_stop=True`:
+```
+"MGKV" → [24, 1, 13, 4, 16, 25]
+"ACDEFGH" → [24, 15, 11, 5, 6, 18, 13, 8, 25]
+"STPQR" → [24, 7, 8, 14, 10, 2, 25]
+```
+#### Step 4: Record sequence lengths
+
+The code keeps track of the original sequence lengths (including start/stop tokens)
+```python
+seq_lengths = [len(seq) for seq in int_seqs]
+```
+
+For our examples:
+```
+seq_lengths = [6, 9, 7]
+```
+
+#### Step 5: Pad sequences to the same length
+
+To process sequences in batches, they need to have the same length. When working with protein sequences of varying lengths (which is almost always the case), padding helps standardize the input shape. The code pads shorter sequences with zeros:
+```python
+max_len = min(max(seq_lengths), self.max_seq_len)
+padded_seqs = tf.keras.preprocessing.sequence.pad_sequences(
+    int_seqs, 
+    maxlen=max_len,
+    padding='post',
+    truncating='post',
+    value=0
+)
+```
+
+For our examples (max length is 9):
+```
+"MGKV" → [24, 1, 13, 4, 16, 25, 0, 0, 0]
+"ACDEFGH" → [24, 15, 11, 5, 6, 18, 13, 8, 25]
+"STPQR" → [24, 7, 8, 14, 10, 2, 25, 0, 0]
+```
+#### Step 6: Create TensorFlow dataset
+
+After all the preparatory work () comes together, we can now build a data pipeline that prepares protein sequences for processing through the neural network. The `create_dataset` method creates the TensorFlow dataset for efficient processing. The dataset is created from the padded sequences:
+
+```python
+dataset = tf.data.Dataset.from_tensor_slices((
+    seq_ids,
+    padded_seqs,
+    seq_lengths
+))
+```
+
+This creates a dataset where each element is a tuple of (id, sequence, length):
+
+```
+(0, [24, 1, 13, 4, 16, 25, 0, 0, 0], 6)
+(1, [24, 15, 11, 5, 6, 18, 13, 8, 25], 9)
+(2, [24, 7, 8, 14, 10, 2, 25, 0, 0], 7)
+```
+
+#### Step 7: Optinally Shuffle the dataset
+
+If `shuffle=True`, the dataset elements are randomly shuffled:
+
+```python
+if self.shuffle:
+    dataset = dataset.shuffle(
+        buffer_size=min(len(int_seqs), 10000),
+        seed=self.seed,
+        reshuffle_each_iteration=True
+    )
+```
+
+This might reorder our examples to something like:
+```
+(1, [24, 15, 11, 5, 6, 18, 13, 8, 25], 9)
+(2, [24, 7, 8, 14, 10, 2, 25, 0, 0], 7)
+(0, [24, 1, 13, 4, 16, 25, 0, 0, 0], 6)
+```
+
+#### Step 8: Batch the dataset
+
+The code groups the sequences into batches of size `batch_size`:
+```python
+dataset = dataset.batch(self.batch_size)
+```
+
+With `batch_size=2`, our examples would be batched as:
+**Batch 1:**
+```
+ids = [1, 2]
+sequences = [
+    [24, 15, 11, 5, 6, 18, 13, 8, 25],
+    [24, 7, 8, 14, 10, 2, 25, 0, 0]
+]
+lengths = [9, 7]
+```
+
+**Batch 2:**
+```
+ids = [0]
+sequences = [
+    [24, 1, 13, 4, 16, 25, 0, 0, 0]
+]
+lengths = [6]
+```
+
+#### Step 9: Feed into mLSTM model
+
+Finally, the batched sequences are fed into the mLSTM model:
+
+```python
+for batch in dataset:
+    seq_ids, sequences, lengths = batch
+    # Process with model
+    representations = model(sequences, lengths)
+```
+
+The model processes each batch and generates representations for each sequence. The lengths tensor tells the model which positions are actual sequence data and which are padding.
+For each sequence, the model produces three types of representations:
+1. **Average hidden state** (`avg_hidden`): The average of all hidden states across the sequence
+2. **Final hidden state** (`final_hidden`): The hidden state after processing the last amino acid
+3. **Final cell state** (`final_cell`): The cell state after processing the last amino acid
+
+These representations capture different aspects of the protein sequence and can be used for downstream tasks like protein function prediction, stability prediction, or protein engineering.
+
+### Testing 
+
+All refactored methods are unit tested by `test_sequence.py`. The test can be run by `python3 -m tests.test_sequence` at the project root level.
+
+```
+=== RUNNING aa_conversion TESTS ===
+Start token - Expected: 24
+Start token - Actual: 24
+Sequence conversion - Expected: [1, 15, 7, 4, 13, 6, 6, 21, 18, 8]
+Sequence conversion - Actual: [1, 15, 7, 4, 13, 6, 6, 21, 18, 8]
+Stop token - Expected: 25
+Stop token - Actual: 25
+No stop token - Expected: 25 not in sequence
+No stop token - Actual: False
+Round-trip conversion - Expected: MASKGEELFT
+Round-trip conversion - Actual: MASKGEELFT
+Token retention - Expected: startMASKGEELFTstop
+Token retention - Actual: startMASKGEELFTstop
+
+=== RUNNING sequence_validation TESTS ===
+Valid sequence check - Expected: True
+Valid sequence check - Actual: True
+Invalid sequence check - Expected: False
+Invalid sequence check - Actual: False
+Too long sequence check - Expected: False
+Too long sequence check - Actual: False
+
+=== RUNNING sequence_tensor_conversion TESTS ===
+Is tensor - Expected: True
+Is tensor - Actual: True
+Tensor shape - Expected: [1, 11]
+Tensor shape - Actual: [1, 11]
+First token - Expected: 24
+First token - Actual: 24
+Middle content - Expected: [1, 15, 7, 4, 13, 6, 6, 21, 18, 8]
+Middle content - Actual: [1, 15, 7, 4, 13, 6, 6, 21, 18, 8]
+Last token (with stop) - Expected: 25
+Last token (with stop) - Actual: 25
+
+=== RUNNING sequence_batcher TESTS ===
+Padded shape - Expected: (2, 12)
+Padded shape - Actual: (2, 12)
+Sequence lengths - Expected: [12, 12]
+Sequence lengths - Actual: [12, 12]
+Is dataset - Expected: True
+Is dataset - Actual: True
+Batch size check - Expected: True
+Batch size check - Actual: True
+Sequence padding check - Expected: True
+Sequence padding check - Actual: True
+
+=== ALL TESTS PASSED ===
+```
+
+
 ---
 
 ## Entry 2: Configuration Module Implementation
