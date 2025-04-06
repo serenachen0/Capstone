@@ -41,7 +41,8 @@ Objective: refactor the UniRep model to ensure deterministic output and improve 
 - [🎯 Goals](#cell-goals)
 - [Implementation Details](#cell-impl-0)
   - [1️⃣ Base LSTM Cell Extraction & Refactoring](#cell-impl-1)
-  - [2️⃣ Implement mLSTM Cell](#cell-impl-2)
+  - [2️⃣ New Methods for Determinstic Behavior and API Consistency](#cell-impl-2)
+  - [3️⃣ Implement mLSTM Cell](#cell-impl-3)
   - [Explanation](#explanation)
   - [Stacked mLSTM Cell Implementation](#4-stacked-mlstm-cell-implementation)
 ### [Entry 3: Refactor Model](#entry-3)
@@ -866,29 +867,40 @@ Sequence padding check - Actual: True
 <a id="cell-impl-0"></a>
 ### ⚙️ Implementation Details
 
-<a id="cell-impl-1">></a>
+<a id="cell-impl-1"></a>
 #### 1️⃣ Base LSTM Cell Extraction & Refactoring
 
+The first step in our refactoring was to create a foundational `BaseLSTMCell` class that would serve as the parent for all specialized LSTM implementations. This addressed several architectural goals:
 
-Original code in `unirep.py` contains two LSTM cell variants and one stack implementation:
+- **Code Organization**: Extract common functionality from the original `mLSTMCell` and `mLSTMCell1900` classes
+- **TensorFlow 2.x Compatibility**: Update to modern Keras layer inheritance
+- **Deterministic Behavior**: Add infrastructure for reproducible results
+
+Analysis of the original code `unirep.py` reveals that there are two LSTM cell variants and one stack implementation:
 1. `mLSTMCell1900` (**lines 125-207**) : a fixed-size multiplicative LSTM cell with 1900 units
 2. `mLSTMCell` (**lines 209-399**) - a configurable multiplicative LSTM cell with customizable initialization.
 3. `mLSTMCellStackNPY` (**lines 301-390**): Stack of mLSTM cells for deep networks
 
-A base LSTM cell class, `BaseLSTMCell`, was created in `cells/base_cell.py` to serve as the foundation for all specialized LSTM implementations. Specifically, this is to generalize a RNN cell structure from `mLSTMCell` and `mLSTMCell1900` from `unirep.py` and abstracts common functionality from the original classes.
+Moreover, original code in `mLSTMCell` and `mLSTMCell1900` had nearly identical:
+- `state_size` and `output_size` properties
+- `zero_state` methods
+- weight normalization logic
+- basic LSTM computation pattern
+
+Therefore, a new base LSTM cell class, `BaseLSTMCell`, was created in `cells/base_cell.py` to generalize a RNN cell structure from `mLSTMCell` and `mLSTMCell1900` from `unirep.py` and abstracts common functionality from the original classes.
 
 ```python
 class BaseLSTMCell(tf.keras.layers.Layer):
     def __init__(
-    self,
-    num_units: int,
-    weight_norm: bool = True,
-    name: str = "base_lstm",
-    **kwargs: Any
+        self,
+        num_units: int,
+        weight_norm: bool = True,
+        name: str = "base_lstm",
+        **kwargs: Any
 ):
 ```
 
-The `BaseLSTMCell` constructor parameters were derived from analysis of the original implementations
+The `BaseLSTMCell` constructor parameters were derived from previous analysis of the original implementations
 
 - `num_units`:  represents the size of cell's hidden state. Originally used in both `mLSTMCell1900` (**line 127**) and `mLSTMCell` (**line 212**)
 - `weight_norm`: controls whether weight normalization is applied. Corresponds to `wn` in the original code (**lines 129** and **222**)
@@ -899,10 +911,10 @@ Extracted common patterns into `BaseLSTMCell` in `cells/base_cell.py`:
 
 | Original Feature | Original Location | Refactored Implementation |
 |------------------|-------------------|---------------------------|
-| State size property | Lines 141-144, 242-245 | `state_size` property |
-| Output size property | Lines 146-149, 247-250 | `output_size` property |
-| Zero state creation | Lines 151-154, 252-255 | `get_initial_state()` method |
-| Weight normalization | Lines 193-197, 285-289 | `apply_weight_norm()` method |
+| State size property | **lines 141-144, 242-245** | `state_size` property |
+| Output size property | **lines 146-149, 247-250** | `output_size` property |
+| Zero state creation | **lines 151-154, 252-255** | `get_initial_state()` method |
+| Weight normalization | **lines 193-197, 285-289** | `apply_weight_norm()` method |
 
 Refactored implementations have better type annotation, and updated return types to match TensorFlow 2.x expectations.
 
@@ -920,29 +932,57 @@ def output_size(self) -> tf.TensorShape:
     return tf.TensorShape([self._num_units])
 ```
 
+
 **Key TensorFlow API Changes**
 
 - Class inheritance: replace `tf.nn.rnn_ce ll.RNNCell` with `tf.keras.layers.Layer`
 - Dimension arguments: replace`dim=0` with `axis=0`
 - State initialization: `zero_state()` → `get_initial_state()`
 
-Added **New Methods for Deterministic Behavior**:
+<a id="cell-impl-2"></a>
+#### 2️⃣ New Methods for Deterministic Behavior and API Consistency
 
-- `deterministic_reduce_mean()`: Ensures consistent reduction operations on GPU
-- `set_seed()`: Standardizes random seed setting for reproducibility
+To address the deterministic behavior requirement, we added two utility methods to the base class:
 
-Added **New Method Structure for TensorFlow 2.x Compatibility**:
+- `deterministic_reduce_mean()` ensures consistent reduction operations on GPU
+- `set_seed()` standardizes random seed setting for reproducibility
 
-1. **`build(input_shape)`**:
-   - Required by TensorFlow 2.x Keras layer API
-   - Called once before the first forward pass to initialize weights
-   - Dynamically creates weight variables based on input dimensions
-   - Creates a clear separation between weight initialization and computation
-2. **`call(inputs, states, training=None)`**:
-   - Core computation method in TensorFlow 2.x
-   - Replaces the old RNNCell's `__call__` pattern
-   - Adds `training` parameter for dropout/normalization behavior
-   - Abstract method in the base class, must be implemented by subclasses
+```python
+    def deterministic_reduce_mean(
+        self,
+        tensor: tf.Tensor,
+        axis: Optional[Union[int, List[int]]] = None,
+        keepdims: bool = False) -> tf.Tensor:
+        """
+        A deterministic implementation of reduce_mean.
+
+        Args:
+            tensor: Input tensor
+            axis: Dimensions to reduce over
+            keepdims: Whether to keep reduced dimensions
+
+        Returns:
+            Reduced tensor
+        """
+        # The original TF reduce_mean can be non-deterministic in some GPU operations
+        # This implementation ensures determinism
+        return tf.reduce_sum(tensor, axis=axis, keepdims=keepdims) / tf.cast(
+            tf.reduce_prod(tf.gather(tf.shape(tensor), axis)), dtype=tensor.dtype
+        )
+    def set_seed(self, seed: Optional[int]=None) -> None:
+        """
+        Set random seed for deterministic behavior.
+
+        Args:
+            seed: Optional random seed
+        """
+        if seed is not None:
+            tf.random.set_seed(seed)
+```
+
+Finally, we adapted to TensorFlow 2.x's build-then-call pattern by implementing:
+- An abstract `build()` method to be overridden by subclasses: required by TensorFlow 2.x Keras layer API, this is called once before the first forward pass to initialize weights dynamically based on input dimensions.
+- An abstract `call()` method with the expected TensorFlow 2.x signature `(inputs, states, training=None)`: replacing the old `__call__` pattern, this core computation method adds `training` paramter for dropout/normalization behavior. Must be implmeneted by subclasses.
 
 ```python
 def build(self, input_shape: tf.TensorShape) -> None:
@@ -979,10 +1019,9 @@ def call(
 - Weight initialization helpers (orthogonal and ones initializers)
 - Weight persistence methods (save/load to NumPy files)
 
-These methods may be implemented in specific cell subclasses as needed.
 
-<a id="cell-impl-2"></a>
-#### 2️⃣ Implement mLSTM Cell
+<a id="cell-impl-3"></a>
+#### 3️⃣ Implement mLSTM Cell
 
 In the original code, the `mLSTMCell` class (**lines 209-299**) implements a configurable multiplicative LSTM cell with customizable initialization. This cell forms the core of the UniRep model's sequence processing capabilities. Our refactoring focuses on updating to TensorFlow 2.x while maintaining the exact same mathematical operations.
 
@@ -1278,21 +1317,7 @@ def load_weights_from_numpy(self, load_path: str) -> None:
         load_weight("rnn_mlstm_mlstm_gmh:0", self.gmh)
 ```
 
-#### 4. Stacked mLSTM Cell Implementation
-
-In the original implementation, `mLSTMCellStackNPY` (**lines 301-390**) creates a stack of mLSTM cells with residual connections and dropout support. We refactor this to work with our new cell architecture and the TensorFlow 2.x API.
-
-The stacked mLSTM cell creates a vertical stack of individual mLSTM cells where:
-
-- Each cell processes the output from the previous cell
-- State information is maintained separately for each layer
-- Optional residual connections allow information to skip layers
-- Dropout can be applied between layers during training
-
-This completes our cell architecture implementation, making us ready to move to the model level in Entry 3.
-
-
-### Key TensorFlow API Changes
+**Key TensorFlow API Changes**
 
 | Feature | TensorFlow 1.x | TensorFlow 2.x | Impact |
 |---------|---------------|----------------|--------|
@@ -1307,6 +1332,21 @@ This completes our cell architecture implementation, making us ready to move to 
 | **Initialization Seeding** | Global via `tf.set_random_seed()` | Per-operation via initializer seeds | Better control over randomness |
 | **Parameter Naming** | Often used positional parameters | Requires named parameters | More explicit, less error-prone |
 | **Categorical Sampling** | `tf.distributions.Categorical()` | `tf.random.categorical()` | API reorganization |
+
+
+#### 4. Stacked mLSTM Cell Implementation
+
+In the original implementation, `mLSTMCellStackNPY` (**lines 301-390**) creates a stack of mLSTM cells with residual connections and dropout support. We refactor this to work with our new cell architecture and the TensorFlow 2.x API.
+
+The stacked mLSTM cell creates a vertical stack of individual mLSTM cells where:
+
+- Each cell processes the output from the previous cell
+- State information is maintained separately for each layer
+- Optional residual connections allow information to skip layers
+- Dropout can be applied between layers during training
+
+This completes our cell architecture implementation, making us ready to move to the model level in Entry 3.
+
 
 
 ### Explanation
