@@ -5,6 +5,8 @@ import os
 import tempfile
 from cells.base_cell import BaseLSTMCell
 from cells.mlstm_cell import mLSTMCell
+from cells.mlstm_stack import StackedMlstmCell
+import unittest
 
 def test_base_cell():
     print("\n=== Testing BaseLSTMCell ===")
@@ -239,6 +241,178 @@ def test_mlstm_edge_cases():
 
     print("mLSTMCell edge case tests passed!")
 
+
+def test_stacked_mlstm_cell():
+    print("\n=== Testing StackedMlstmCell ===")
+
+    # Set random seeds for reproducibility
+    tf.random.set_seed(42)
+    np.random.seed(42)
+
+    # Default parameters for testing
+    num_units = 32
+    num_layers = 3
+    batch_size = 4
+    input_dim = 10
+
+    # Create stacked cell
+    stacked_cell = StackedMlstmCell(
+        num_units=num_units,
+        num_layers=num_layers,
+        seed=42
+    )
+
+    # Test initialization
+    print("Testing initialization...")
+    assert stacked_cell._num_units == num_units, "Incorrect num_units"
+    assert stacked_cell._num_layers == num_layers, "Incorrect num_layers"
+    assert len(stacked_cell._cells) == num_layers, "Incorrect number of cells"
+
+    # Check that all cells are mLSTMCell instances
+    for cell in stacked_cell._cells:
+        assert isinstance(cell, mLSTMCell), "Cell is not an instance of mLSTMCell"
+
+    # Check state size
+    cell_sizes, hidden_sizes = stacked_cell.state_size
+    assert len(cell_sizes) == num_layers, "Incorrect cell state size"
+    assert len(hidden_sizes) == num_layers, "Incorrect hidden state size"
+
+    # Check output size
+    assert stacked_cell.output_size == tf.TensorShape([num_units]), "Incorrect output size"
+
+    # Test initial state
+    print("Testing initial state...")
+    initial_state = stacked_cell.get_initial_state(batch_size=batch_size)
+
+    # Check state structure
+    cell_states, hidden_states = initial_state
+    assert len(cell_states) == num_layers, "Incorrect number of cell states"
+    assert len(hidden_states) == num_layers, "Incorrect number of hidden states"
+
+    # Check state shapes
+    for i in range(num_layers):
+        assert cell_states[i].shape == (batch_size, num_units), f"Incorrect cell state shape for layer {i}"
+        assert hidden_states[i].shape == (batch_size, num_units), f"Incorrect hidden state shape for layer {i}"
+
+    # Test forward pass
+    print("Testing forward pass...")
+    inputs = tf.random.normal((batch_size, input_dim), seed=42)
+
+    # Run forward pass
+    output, final_state = stacked_cell(
+        inputs=inputs,
+        states=initial_state,
+        training=False
+    )
+
+    # Check output shape
+    assert output.shape == (batch_size, num_units), "Incorrect output shape"
+
+    # Check state structure
+    cell_states, hidden_states = final_state
+    assert len(cell_states) == num_layers, "Incorrect number of final cell states"
+    assert len(hidden_states) == num_layers, "Incorrect number of final hidden states"
+
+    # Check state shapes
+    for i in range(num_layers):
+        assert cell_states[i].shape == (batch_size, num_units), f"Incorrect final cell state shape for layer {i}"
+        assert hidden_states[i].shape == (batch_size, num_units), f"Incorrect final hidden state shape for layer {i}"
+
+    # Test residual connections
+    print("Testing residual connections...")
+    stacked_cell_residual = StackedMlstmCell(
+        num_units=num_units,
+        num_layers=num_layers,
+        residual_connections=True,
+        seed=42
+    )
+
+    output_residual, _ = stacked_cell_residual(
+        inputs=inputs,
+        states=initial_state,
+        training=False
+    )
+
+    # Outputs with and without residual connections should be different
+    assert not np.allclose(output.numpy(), output_residual.numpy()), "Residual connections had no effect"
+
+    # Test dropout
+    print("Testing dropout...")
+    dropout_rate = 0.5
+    stacked_cell_dropout = StackedMlstmCell(
+        num_units=num_units,
+        num_layers=num_layers,
+        dropout_rate=dropout_rate,
+        seed=42
+    )
+
+    # Run in training mode with dropout
+    output_training, _ = stacked_cell_dropout(
+        inputs=inputs,
+        states=initial_state,
+        training=True
+    )
+
+    # Run in inference mode without dropout
+    output_inference, _ = stacked_cell_dropout(
+        inputs=inputs,
+        states=initial_state,
+        training=False
+    )
+
+    # Outputs with and without dropout should be different
+    assert not np.allclose(output_training.numpy(), output_inference.numpy()), "Dropout had no effect"
+
+    # Test deterministic behavior
+    print("Testing deterministic behavior...")
+
+    # Reset random seeds
+    tf.random.set_seed(42)
+    np.random.seed(42)
+
+    # Create stacked cell again
+    stacked_cell2 = StackedMlstmCell(
+        num_units=num_units,
+        num_layers=num_layers,
+        seed=42
+    )
+
+    # Create input again
+    inputs2 = tf.random.normal((batch_size, input_dim), seed=42)
+
+    # Get initial state
+    initial_state2 = stacked_cell2.get_initial_state(batch_size=batch_size)
+
+    # Run forward pass
+    output2, final_state2 = stacked_cell2(
+        inputs=inputs2,
+        states=initial_state2,
+        training=False
+    )
+
+    # Check that outputs are identical
+    assert np.allclose(output.numpy(), output2.numpy()), "Outputs are not deterministic"
+
+    # Test sequence processing
+    print("Testing sequence processing...")
+    seq_len = 5
+    sequence = tf.random.normal((batch_size, seq_len, input_dim), seed=42)
+
+    # Process sequence with RNN layer
+    rnn_layer = tf.keras.layers.RNN(
+        stacked_cell,
+        return_sequences=True,
+        return_state=True
+    )
+
+    # Run forward pass
+    outputs, *final_states = rnn_layer(sequence, initial_state=initial_state)
+
+    # Check output shape
+    assert outputs.shape == (batch_size, seq_len, num_units), "Incorrect sequence output shape"
+
+    print("StackedMlstmCell tests passed!")
+
 def run_all_tests():
     print("Running all cell tests...")
     try:
@@ -248,11 +422,296 @@ def run_all_tests():
         test_mlstm_weight_loading()
         test_mlstm_computational_correctness()
         test_mlstm_edge_cases()
+        test_stacked_mlstm_cell()  # Added new test function
         print("\n✅ All tests passed!")
     except AssertionError as e:
         print(f"\n❌ Test failed: {e}")
     except Exception as e:
         print(f"\n❌ Error encountered: {e}")
 
+class TestStackedMlstmCell(unittest.TestCase):
+    """Test cases for the StackedMlstmCell class."""
+
+    def setUp(self):
+        # Set random seeds for reproducibility
+        tf.random.set_seed(42)
+        np.random.seed(42)
+
+        # Default parameters for testing
+        self.num_units = 32
+        self.num_layers = 3
+        self.batch_size = 4
+        self.input_dim = 10
+        self.seed = 42
+
+    def test_initialization(self):
+        """Test basic initialization of the stacked cell."""
+        # Create stacked cell
+        stacked_cell = StackedMlstmCell(
+            num_units=self.num_units,
+            num_layers=self.num_layers,
+            seed=self.seed
+        )
+
+        # Check that properties are set correctly
+        self.assertEqual(stacked_cell._num_units, self.num_units)
+        self.assertEqual(stacked_cell._num_layers, self.num_layers)
+        self.assertEqual(stacked_cell._seed, self.seed)
+        self.assertEqual(len(stacked_cell._cells), self.num_layers)
+
+        # Check that all cells are mLSTMCell instances
+        for cell in stacked_cell._cells:
+            self.assertIsInstance(cell, mLSTMCell)
+
+        # Check state size
+        cell_sizes, hidden_sizes = stacked_cell.state_size
+        self.assertEqual(len(cell_sizes), self.num_layers)
+        self.assertEqual(len(hidden_sizes), self.num_layers)
+
+        # Check output size
+        self.assertEqual(stacked_cell.output_size, tf.TensorShape([self.num_units]))
+
+    def test_initial_state(self):
+        """Test creation of initial state."""
+        # Create stacked cell
+        stacked_cell = StackedMlstmCell(
+            num_units=self.num_units,
+            num_layers=self.num_layers,
+            seed=self.seed
+        )
+
+        # Get initial state
+        initial_state = stacked_cell.get_initial_state(batch_size=self.batch_size)
+
+        # Check state structure
+        cell_states, hidden_states = initial_state
+        self.assertEqual(len(cell_states), self.num_layers)
+        self.assertEqual(len(hidden_states), self.num_layers)
+
+        # Check state shapes
+        for i in range(self.num_layers):
+            self.assertEqual(cell_states[i].shape, (self.batch_size, self.num_units))
+            self.assertEqual(hidden_states[i].shape, (self.batch_size, self.num_units))
+
+        # Check that states are zero-initialized
+        for i in range(self.num_layers):
+            self.assertTrue(np.all(cell_states[i].numpy() == 0))
+            self.assertTrue(np.all(hidden_states[i].numpy() == 0))
+
+    def test_forward_pass(self):
+        """Test forward pass through the stacked cell."""
+        # Create stacked cell
+        stacked_cell = StackedMlstmCell(
+            num_units=self.num_units,
+            num_layers=self.num_layers,
+            seed=self.seed
+        )
+
+        # Create input
+        inputs = tf.random.normal((self.batch_size, self.input_dim))
+
+        # Get initial state
+        initial_state = stacked_cell.get_initial_state(batch_size=self.batch_size)
+
+        # Run forward pass
+        output, final_state = stacked_cell(
+            inputs=inputs,
+            states=initial_state,
+            training=False
+        )
+
+        # Check output shape
+        self.assertEqual(output.shape, (self.batch_size, self.num_units))
+
+        # Check state structure
+        cell_states, hidden_states = final_state
+        self.assertEqual(len(cell_states), self.num_layers)
+        self.assertEqual(len(hidden_states), self.num_layers)
+
+        # Check state shapes
+        for i in range(self.num_layers):
+            self.assertEqual(cell_states[i].shape, (self.batch_size, self.num_units))
+            self.assertEqual(hidden_states[i].shape, (self.batch_size, self.num_units))
+
+        # Check that output matches final hidden state of last layer
+        self.assertTrue(np.allclose(output.numpy(), hidden_states[-1].numpy()))
+
+    def test_residual_connections(self):
+        """Test residual connections in the stacked cell."""
+        # Create stacked cell with residual connections
+        stacked_cell = StackedMlstmCell(
+            num_units=self.num_units,
+            num_layers=self.num_layers,
+            residual_connections=True,
+            seed=self.seed
+        )
+
+        # Create input
+        inputs = tf.random.normal((self.batch_size, self.input_dim))
+
+        # Get initial state
+        initial_state = stacked_cell.get_initial_state(batch_size=self.batch_size)
+
+        # Run forward pass
+        output, final_state = stacked_cell(
+            inputs=inputs,
+            states=initial_state,
+            training=False
+        )
+
+        # Check output shape
+        self.assertEqual(output.shape, (self.batch_size, self.num_units))
+
+        # Create stacked cell without residual connections
+        stacked_cell_no_residual = StackedMlstmCell(
+            num_units=self.num_units,
+            num_layers=self.num_layers,
+            residual_connections=False,
+            seed=self.seed
+        )
+
+        # Run forward pass without residual connections
+        output_no_residual, _ = stacked_cell_no_residual(
+            inputs=inputs,
+            states=initial_state,
+            training=False
+        )
+
+        # Check that outputs are different
+        self.assertFalse(np.allclose(output.numpy(), output_no_residual.numpy()))
+
+    def test_dropout(self):
+        """Test dropout in the stacked cell."""
+        # Create stacked cell with dropout
+        dropout_rate = 0.5
+        stacked_cell = StackedMlstmCell(
+            num_units=self.num_units,
+            num_layers=self.num_layers,
+            dropout_rate=dropout_rate,
+            seed=self.seed
+        )
+
+        # Create input
+        inputs = tf.random.normal((self.batch_size, self.input_dim))
+
+        # Get initial state
+        initial_state = stacked_cell.get_initial_state(batch_size=self.batch_size)
+
+        # Run forward pass in training mode
+        output_training, _ = stacked_cell(
+            inputs=inputs,
+            states=initial_state,
+            training=True
+        )
+
+        # Run forward pass in inference mode
+        output_inference, _ = stacked_cell(
+            inputs=inputs,
+            states=initial_state,
+            training=False
+        )
+
+        # Check that outputs are different due to dropout
+        self.assertFalse(np.allclose(output_training.numpy(), output_inference.numpy()))
+
+    def test_deterministic_behavior(self):
+        """Test deterministic behavior with fixed seeds."""
+        # Create stacked cell
+        stacked_cell = StackedMlstmCell(
+            num_units=self.num_units,
+            num_layers=self.num_layers,
+            seed=self.seed
+        )
+
+        # Create input
+        inputs = tf.random.normal((self.batch_size, self.input_dim), seed=self.seed)
+
+        # Get initial state
+        initial_state = stacked_cell.get_initial_state(batch_size=self.batch_size)
+
+        # Run forward pass
+        output1, final_state1 = stacked_cell(
+            inputs=inputs,
+            states=initial_state,
+            training=False
+        )
+
+        # Reset random seeds
+        tf.random.set_seed(self.seed)
+        np.random.seed(self.seed)
+
+        # Create stacked cell again
+        stacked_cell2 = StackedMlstmCell(
+            num_units=self.num_units,
+            num_layers=self.num_layers,
+            seed=self.seed
+        )
+
+        # Create input again
+        inputs2 = tf.random.normal((self.batch_size, self.input_dim), seed=self.seed)
+
+        # Get initial state
+        initial_state2 = stacked_cell2.get_initial_state(batch_size=self.batch_size)
+
+        # Run forward pass
+        output2, final_state2 = stacked_cell2(
+            inputs=inputs2,
+            states=initial_state2,
+            training=False
+        )
+
+        # Check that outputs are identical
+        self.assertTrue(np.allclose(output1.numpy(), output2.numpy()))
+
+        # Check that states are identical
+        cell_states1, hidden_states1 = final_state1
+        cell_states2, hidden_states2 = final_state2
+
+        for i in range(self.num_layers):
+            self.assertTrue(np.allclose(cell_states1[i].numpy(), cell_states2[i].numpy()))
+            self.assertTrue(np.allclose(hidden_states1[i].numpy(), hidden_states2[i].numpy()))
+
+    def test_sequence_processing(self):
+        """Test processing a sequence through the stacked cell."""
+        # Create stacked cell
+        stacked_cell = StackedMlstmCell(
+            num_units=self.num_units,
+            num_layers=self.num_layers,
+            seed=self.seed
+        )
+
+        # Create sequence input [batch_size, seq_len, input_dim]
+        seq_len = 5
+        sequence = tf.random.normal((self.batch_size, seq_len, self.input_dim), seed=self.seed)
+
+        # Get initial state
+        initial_state = stacked_cell.get_initial_state(batch_size=self.batch_size)
+
+        # Process sequence with RNN layer
+        rnn_layer = tf.keras.layers.RNN(
+            stacked_cell,
+            return_sequences=True,
+            return_state=True
+        )
+
+        # Run forward pass
+        outputs, *final_states = rnn_layer(sequence, initial_state=initial_state)
+
+        # Check output shape [batch_size, seq_len, num_units]
+        self.assertEqual(outputs.shape, (self.batch_size, seq_len, self.num_units))
+
+        # Unpack final states
+        cell_states, hidden_states = final_states
+
+         # Check state structure
+        self.assertEqual(len(cell_states), self.num_layers)
+        self.assertEqual(len(hidden_states), self.num_layers)
+
+        # Check state shapes
+        for i in range(self.num_layers):
+            self.assertEqual(cell_states[i].shape, (self.batch_size, self.num_units))
+            self.assertEqual(hidden_states[i].shape, (self.batch_size, self.num_units))
+
 if __name__ == "__main__":
+    # Option 1: Run simple functional tests
     run_all_tests()
