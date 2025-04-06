@@ -43,6 +43,7 @@ Objective: refactor the UniRep model to ensure deterministic output and improve 
   - [1️⃣ Base LSTM Cell Extraction & Refactoring](#cell-impl-1)
   - [2️⃣ New Methods for Determinstic Behavior and API Consistency](#cell-impl-2)
   - [3️⃣ Implement mLSTM Cell](#cell-impl-3)
+- [🔄 TensorFlow API Changes](#cell-tf-changes)
   - [Explanation](#explanation)
   - [Stacked mLSTM Cell Implementation](#4-stacked-mlstm-cell-implementation)
 ### [Entry 3: Refactor Model](#entry-3)
@@ -1023,10 +1024,15 @@ def call(
 <a id="cell-impl-3"></a>
 #### 3️⃣ Implement mLSTM Cell
 
-In the original code, the `mLSTMCell` class (**lines 209-299**) implements a configurable multiplicative LSTM cell with customizable initialization. This cell forms the core of the UniRep model's sequence processing capabilities. Our refactoring focuses on updating to TensorFlow 2.x while maintaining the exact same mathematical operations.
+The multiplicative LSTM (`mLSTM`) cell is a critical component of the UniRep architecture, combining the memory capabilities of LSTM with multiplicative interactions that make it particularly effective for learning protein sequence representations. In the original code, the `mLSTMCell` class (**lines 209-299**) implements a configurable multiplicative LSTM cell with customizable initialization. Our refactoring focuses on updating to TensorFlow 2.x while maintaining the exact same mathematical operations with the following design pricniples:
 
-The original constructor (**lines 209-226**) contained many individual initializers and configuration parameters:
+- **Mathematical Fidelity**: Preserve the exact computational graph of the original implementation while updating the API
+- **Deterministic Behavior**: Ensure reproducible results through explicit seeding and deterministic operations
+- **Modern TensorFlow**: Leverage TensorFlow 2.x features including the Keras Layer API
+- **Weight Compatibility**: Maintain ability to load pre-trained weights from the original model
 
+
+Starting with the constructor, the original constructor (**lines 209-226**) contained many individual initializers and configuration parameters:
 ```python
 # Original code (unirep.py, lines 209-226)
 class mLSTMCell(tf.nn.rnn_cell.RNNCell):
@@ -1051,12 +1057,12 @@ class mLSTMCell(tf.nn.rnn_cell.RNNCell):
         self._var_device = var_device
         # ... stores initializers as instance variables
 ```
-
 Our refactored constructor is streamlined to leverage the `BaseLSTMCell` parent class and focus on the unique aspects of the mLSTM cell
-
-- Added `seed` parameter for deterministic behavior
+- `num_units`: Controls the dimensionality of the hidden and cell states
+- `seed`: Added for deterministic behavior (not present in original implementation)
+- `name`: Keras-style naming convention to replace the original `scope` parameter
+- `weight_norm`: rename `wn` → `weight_norm` that enables L2 normalization of weights for improved training stability
 - Removed device placement parameter (`var_device`) as this is handled differently in TensorFlow 2.x
-- Renamed parameters for clarity (`wn` → `weight_norm`, `scope` → `name`)
 - Added type annotations for better code safety
 
 ```python
@@ -1089,7 +1095,7 @@ class mLSTMCell(BaseLSTMCell):
         self.set_seed(seed)
 ```
 
-For **weight initialization**, the original code in `unirep.py` used `tf.get_variable()` with initializers for each weight (**lines 264-283**).
+For **weight initialization**, the original code used `tf.get_variable()` with initializers for each weight (**lines 264-283**).
 
 ```python
 with tf.variable_scope(self._scope):
@@ -1113,15 +1119,11 @@ with tf.variable_scope(self._scope):
         gmh = tf.get_variable(
             "gmh", initializer=self._gmh_init)
 ```
-
-In TensorFlow 2.x, we use the `build()` method to create weights:
+In TensorFlow 2.x, we use the `build()` method to create weights.  The `build` method exemplifies the modern approach of separating weight creation from computation, which differs substantially from the TensorFlow 1.x approach where weights were created during the first call.
 
 - Added explicit `seed` parameter for deterministic initialization
-
 - Use `self.add_weight()` instead of `tf.get_variable()`
-
 - Dynamically determine input dimension from `input_shape` parameter
-
 - Set `self.built = True` to signal that the layer is built
 
 ```python
@@ -1202,7 +1204,7 @@ def build(self, input_shape: tf.TensorShape) -> None:
     self.built = True
 ```
 
-For **cell computation**, the original code in `unirep.py` implemented the core mLSTM computation in the `call()` method (**lines 290-298**).
+Moving onto **cell computation**, the original code implemented the core mLSTM computation in the `call()` methods (**lines 198-206, 290-298**).
 
 ```python
  m = tf.matmul(inputs, wmx) * tf.matmul(h_prev, wmh)
@@ -1216,14 +1218,10 @@ For **cell computation**, the original code in `unirep.py` implemented the core 
         h = o * tf.tanh(c)
 ```
 
-We refactor this to use TensorFlow 2.x API by:
-
+I implemented `call()` that preserves the mathematical structure of the original mLSTM while updating to TensorFlow 2.x API conventions. The multiplicative interaction between the input and previous hidden states are the same:
 - Updated parameter signature to include `training` parameter
-
-- Improved type annotations for better code safety
-
 - Updated `tf.split()` to use `axis` parameter instead of positional argument
-
+- Improved type annotations for better code safety
 - Added more detailed comments to explain each step of the computation
 
 ```python
@@ -1281,7 +1279,14 @@ def call(
     return h, (c, h)
 ```
 
-For **weight loading**, oo maintain compatibility with the original model weights, we implement a method to load weights from `NumPy` files:
+For **weight loading**, original code loads weight differently acorss three different classes:
+- for `mLSTMCell1900` (**lines 162-191**) loads pre-trained weights directly during initialization inside the `call()` method. It assumes weights will always be loaded from `NumPy` files and is hard-coded for this specific model.
+- `mLSTMCell` doesn't load weights directly, and receives initializers as constructor parameters (**lines 211-225**). By default, these parameters are intialized with random orthogonal weights. If pre-trained weights need to be used, they are passed to the initializers (**lines 264-283**).
+- `mLSTMStackNPY` creates a stack of `mLSTMCell` instances, and loads pre-trained weights in its constructor (**lines 323 - 339**) to each `mLSTMCell`.
+
+This inconsistent weight loading patterns creates significant maintenance challenges. The `mLSTMCell1900` loads weights during call execution, the base `mLSTMCell` expects initializers to be passed in, and `mLSTMCellStackNPY` loads weights during construction to configure child cells. The pattern increases cognitive overhead, complicates debugging, and creates potential for silent failures when working with pre-trained weights.
+
+To address this issue with more robust weight loading mechanism, I impmlemented `load_weights_from_numpy()` that provides explicit weight loading after the cell is built, separating model definition from weight initialization. The method first validates that the cell is already built to prevent loading weights into non-existent variables. It then uses a helper function `load_weight()` to handle individual weight loading with proper error handling, checking for file existence and providing clear warnings for missing files. The implementation directly assigns loaded values to existing variables using TensorFlow's `assign()` method, and conditionally loads weight normalization parameters only when enabled. This explicit, unified approach improves code maintainability, provides better error handling, and offers flexibility to load weights at any point after cell initialization, addressing the inconsistencies found in the original implementation.
 
 ```python
 def load_weights_from_numpy(self, load_path: str) -> None:
@@ -1317,23 +1322,6 @@ def load_weights_from_numpy(self, load_path: str) -> None:
         load_weight("rnn_mlstm_mlstm_gmh:0", self.gmh)
 ```
 
-**Key TensorFlow API Changes**
-
-| Feature | TensorFlow 1.x | TensorFlow 2.x | Impact |
-|---------|---------------|----------------|--------|
-| **Weight Creation** | `tf.get_variable("wx", initializer=wx_init)` | `self.add_weight(name="wx", shape=[...], initializer=...)` | Requires explicit shape specification |
-| **Variable Scope** | `with tf.variable_scope(self._scope):` | Layer-based hierarchy with `name` parameter | Simplified variable organization |
-| **Weight Normalization** | `tf.nn.l2_normalize(wx, dim=0)` | `tf.nn.l2_normalize(wx, axis=0)` | Parameter name change |
-| **Tensor Splitting** | `tf.split(z, 4, 1)` | `tf.split(z, 4, axis=1)` | More explicit parameter naming |
-| **Class Inheritance** | `tf.nn.rnn_cell.RNNCell` | `tf.keras.layers.Layer` | Aligns with Keras API |
-| **Build Pattern** | Variables created in `call()` | Variables created in `build()` | Better separation of initialization and computation |
-| **State Management** | `zero_state(batch_size, dtype)` | `get_initial_state(inputs, batch_size, dtype)` | More flexible state initialization |
-| **Training Mode** | Not explicitly supported | `training` parameter in `call()` | Supports training-specific behaviors |
-| **Initialization Seeding** | Global via `tf.set_random_seed()` | Per-operation via initializer seeds | Better control over randomness |
-| **Parameter Naming** | Often used positional parameters | Requires named parameters | More explicit, less error-prone |
-| **Categorical Sampling** | `tf.distributions.Categorical()` | `tf.random.categorical()` | API reorganization |
-
-
 #### 4. Stacked mLSTM Cell Implementation
 
 In the original implementation, `mLSTMCellStackNPY` (**lines 301-390**) creates a stack of mLSTM cells with residual connections and dropout support. We refactor this to work with our new cell architecture and the TensorFlow 2.x API.
@@ -1347,9 +1335,8 @@ The stacked mLSTM cell creates a vertical stack of individual mLSTM cells where:
 
 This completes our cell architecture implementation, making us ready to move to the model level in Entry 3.
 
-
-
-### Explanation
+<a id="cell-tf-changes"></a>
+### 🔄 Tensorflow API Changes
 
 The multiplicative LSTM (mLSTM) combines the benefits of LSTM cells with multiplicative RNN dynamics, allowing for stronger expressivity in sequence modeling. Here's how it works:
 
