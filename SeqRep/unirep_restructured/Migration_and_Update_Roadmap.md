@@ -43,9 +43,9 @@ Objective: refactor the UniRep model to ensure deterministic output and improve 
   - [1️⃣ Base LSTM Cell Extraction & Refactoring](#cell-impl-1)
   - [2️⃣ New Methods for Determinstic Behavior and API Consistency](#cell-impl-2)
   - [3️⃣ Implement mLSTM Cell](#cell-impl-3)
+  - [4️⃣ Stacked mLSTM Cell Implementation](#cell-impl-4)
 - [🔄 TensorFlow API Changes](#cell-tf-changes)
-  - [Explanation](#explanation)
-  - [Stacked mLSTM Cell Implementation](#4-stacked-mlstm-cell-implementation)
+- [🧪 Testing](#cell-testing)
 ### [Entry 3: Refactor Model](#entry-3)
 
 
@@ -1321,65 +1321,374 @@ def load_weights_from_numpy(self, load_path: str) -> None:
         load_weight("rnn_mlstm_mlstm_gmx:0", self.gmx)
         load_weight("rnn_mlstm_mlstm_gmh:0", self.gmh)
 ```
+<a id="cell-impl-4"></a>
+#### 4️⃣ Stacked mLSTM Cell Implementation
 
-#### 4. Stacked mLSTM Cell Implementation
+The stacked mLSTM cell is essential for creating deeper network architectures by combining multiple mLSTM layers. In the original implementation, `mLSTMCellStackNPY` (**lines 301-390**) creates a stack of mLSTM cells with residual connections and dropout support. Our refactoring goal was to modernize this approach for TensorFlow 2.x while maintaining the same functionality with the following design principles:
 
-In the original implementation, `mLSTMCellStackNPY` (**lines 301-390**) creates a stack of mLSTM cells with residual connections and dropout support. We refactor this to work with our new cell architecture and the TensorFlow 2.x API.
+- **Modularity**: Create a clean composition of individual mLSTM cells
+- **Modern Layer API**: Update to TensorFlow 2.x Keras layer inheritance
+- **Regularization Options**: Support for dropout and residual connections
+- **Deterministic Behavior**: Ensure reproducible results through explicit seeding
+- **Weight Compatibility**: Maintain the ability to load pre-trained weights
 
-The stacked mLSTM cell creates a vertical stack of individual mLSTM cells where:
+**Constructor implementation**: as discussed previously, the original constructor (**lines 303-344**) combined multiple different responsibilities in one method, handling both cell creation and weight loading together rather than separating these distinct operations.
+```python
+# Original code (unirep.py, approximate lines 303-344)
+class mLSTMCellStackNPY(tf.nn.rnn_cell.RNNCell):
+    def __init__(self,
+                 num_units,
+                 num_layers,
+                 dropout=None,
+                 residual=False,
+                 weight_path="./",
+                 wn=True,
+                 scope='mlstm_stack'):
+        # ...cell creation logic...
+        # ...weight loading logic...
+```
 
-- Each cell processes the output from the previous cell
-- State information is maintained separately for each layer
-- Optional residual connections allow information to skip layers
-- Dropout can be applied between layers during training
+Our refactored constructor separates these concerns by
+- Moved weight loading to a separate method `load_weights_from_numpy()` for better separation of concerns
+- Renamed parameters for clarity (e.g., `dropout` → `dropout_rate`, `residual` → `residual_connections`)
+- Added type annotations for better code safety
+- Added a `seed` parameter for deterministic behaviormodilarity
 
-This completes our cell architecture implementation, making us ready to move to the model level in Entry 3.
+```python
+def __init__(
+    self,
+    num_units: int = 64,
+    num_layers: int = 4,
+    dropout_rate: Optional[float] = None,
+    residual_connections: bool = False,
+    weight_norm: bool = True,
+    seed: Optional[int] = None,
+    name: str = "stacked_mlstm",
+    **kwargs: Any
+):
+    """
+    Initialize a stack of mLSTM cells.
+
+    Args:
+        num_units: Number of units in each mLSTM cell
+        num_layers: Number of layers in the stack
+        dropout_rate: Optional dropout rate for regularization
+        residual_connections: Whether to use residual connections
+        weight_norm: Whether to use weight normalization
+        seed: Random seed for deterministic behavior
+        name: Name of the stack
+    """
+    # ... constructor body ...
+```
+
+**Cell creation logic** in the original implementation is somewhat hardcoded (**lines 325-339**): weight files are directly loaded with hardcoded naming patterns inside the constructor. Each weight file path is then created using string formatting with fixed patterns. Dropout is also handled in a fixed way as it only applies dropout to all but the last layer, with no option for different dropout rates per layer.
+
+```python
+# Original code (lines 325-339)
+layers = [mLSTMCell(
+    num_units=self._num_units,
+    wn=self._wn,
+    scope=self._scope + str(i),
+    var_device=self._var_device,
+    wx_init=np.load(join(bs + "{0}_mlstm_stack{1}_wx:0.npy".format(i,i))),
+    # ... other weight initializations ...
+) for i in range(self._num_layers)]
+
+if self._dropout:
+    layers = [
+        tf.contrib.rnn.DropoutWrapper(
+            layer, output_keep_prob=1-self._dropout) for layer in layers[:-1]] + layers[-1:]
+```
+
+The refactored version improves this to better align with TensorFlow 2.x layer composition: explicit unique seed per layer for deterministic behavior, more explicit layer structure with consistent naming shceme, and clear organization of cell creation with dedicated dropout layers.
+```python
+# Create the stack of cells
+self._cells = []
+for i in range(self._num_layers):
+    layer_seed = None if seed is None else seed + i
+    cell = mLSTMCell(
+        num_units=self._num_units,
+        weight_norm=self._weight_norm,
+        seed=layer_seed,  # Unique seed per layer
+        name=f"{name}_layer_{i}"
+    )
+
+    self._cells.append(cell)
+
+# Create dropout layers if specified
+if self._dropout_rate is not None:
+    self._dropout_layers = []
+    for i in range(self._num_layers - 1):  # No dropout after last layer
+        dropout_seed = None if seed is None else seed + self._num_layers + i
+        self._dropout_layers.append(
+            tf.keras.layers.Dropout(
+                rate=self._dropout_rate,
+                seed=dropout_seed
+            )
+        )
+else:
+    self._dropout_layers = None
+```
+
+For **state management**, the stacked cell needs to track states for all layers. The original implementation used TensorFlow 1.x's RNNCell interface with `zero_state()` (**lines 346-362**) and direct tuple manipulation without type annotations, while lacking training mode parameters for dropout.
+
+```python
+# Original code (lines 346-362)
+@property
+def state_size(self):
+    # The state is a tuple of c and h
+    return (
+        tuple(self._num_units for _ in range(self._num_layers)),
+        tuple(self._num_units for _ in range(self._num_layers))
+        )
+
+@property
+def output_size(self):
+    # The output is h
+    return (self._num_units)
+
+def zero_state(self, batch_size, dtype):
+    c_stack = tuple(tf.zeros([batch_size, self._num_units], dtype=dtype) for _ in range(self._num_layers))
+    h_stack = tuple(tf.zeros([batch_size, self._num_units], dtype=dtype) for _ in range(self._num_layers))
+    return (c_stack, h_stack)
+```
+
+The refactored implementation updates to TensorFlow 2.x with improved type annotations:
+- `zero_state()` is replaced by `get_initial_state()`
+- Added flexibility to infer parameters from inputs
+- Improved type annotations for better code safety
+
+```python
+@property
+def state_size(self) -> Tuple[Tuple[tf.TensorShape, ...], Tuple[tf.TensorShape, ...]]:
+    """Return size of cell and hidden states for all layers."""
+    # Each layer has its own cell and hidden state
+    cell_sizes = tuple(tf.TensorShape([self._num_units]) for _ in range(self._num_layers))
+    hidden_sizes = tuple(tf.TensorShape([self._num_units]) for _ in range(self._num_layers))
+    return (cell_sizes, hidden_sizes)
+
+@property
+def output_size(self) -> tf.TensorShape:
+    """Return size of output (hidden state of the last layer)."""
+    return tf.TensorShape([self._num_units])
+
+def get_initial_state(
+    self,
+    inputs: Optional[tf.Tensor] = None,
+    batch_size: Optional[int] = None,
+    dtype: Optional[tf.DType] = None
+) -> Tuple[Tuple[tf.Tensor, ...], Tuple[tf.Tensor, ...]]:
+    """
+    Create zero states for all layers.
+
+    Args:
+        inputs: Optional inputs tensor to infer batch size
+        batch_size: Optional explicit batch size
+        dtype: Optional data type
+
+    Returns:
+        Tuple of (cell_states, hidden_states) for all layers
+    """
+    # ... method implementation ...
+```
+
+**Forward pass** implementation in the original code (**lines 374-381**) used conditional logic to process the first layer differently:
+```python
+# lines 374-381
+for i, layer in enumerate(self._layers):
+    if i == 0:
+        h, (c,h_state) = layer(inputs, (c_prev[i],h_prev[i]))
+    else:
+        h, (c,h_state) = layer(new_outputs[-1], (c_prev[i],h_prev[i]))
+    new_outputs.append(h)
+    new_cs.append(c)
+    new_hs.append(h_state)
+```
+
+The refactored version uses a more consistent apporach by initializing `lay_input = inputs` before the loop, then updating it after each layer processes it, eliminating the needs for conditional logic that was present in the original for first layer
+```python
+def call(
+    self,
+    inputs: tf.Tensor,
+    states: Tuple[Tuple[tf.Tensor, ...], Tuple[tf.Tensor, ...]],
+    training: Optional[bool] = None
+) -> Tuple[tf.Tensor, Tuple[Tuple[tf.Tensor, ...], Tuple[tf.Tensor, ...]]]:
+    """
+    Run one step of the stacked mLSTM cell.
+
+    Args:
+        inputs: Input tensor of shape [batch_size, input_dim]
+        states: Tuple of (cell_states, hidden_states) for all layers
+        training: Whether in training mode (for dropout)
+
+    Returns:
+        Tuple of (output, next_states)
+    """
+    # Unpack states
+    cell_states, hidden_states = states
+
+    new_cell_states = []
+    new_hidden_states = []
+    outputs = []
+
+    layer_input = inputs
+
+    # Process each layer
+    for i, cell in enumerate(self._cells):
+        cell_state = cell_states[i]
+        hidden_state = hidden_states[i]
+
+        # Apply the cell
+        output, (new_cell, new_hidden) = cell(
+            layer_input,
+            (cell_state, hidden_state),
+            training=training
+        )
+
+        # Store new states
+        new_cell_states.append(new_cell)
+        new_hidden_states.append(new_hidden)
+        outputs.append(output)
+
+        # Apply dropout to the output (except for the last layer)
+        if i < self._num_layers - 1 and self._dropout_rate is not None:
+            layer_input = self._dropout_layers[i](output, training=training)
+        else:
+            layer_input = output
+```
+
+**Residual connections** are handled similarly in the original (**lines 383-388**) and refactored implementation where refactored version uses modern TensorFlow operations:
+```python
+# Original code (lines 383-388)
+if self._res_connect:
+    # Make sure number of layers does not affect the scale of the output
+    scale_factor = tf.constant(1 / float(self._num_layers))
+    final_output = tf.scalar_mul(scale_factor,tf.add_n(new_outputs))
+else:
+    final_output = new_outputs[-1]
+```
+
+```python
+# Refactored version in mlstm_stack.py
+# Apply residual connections if specified
+if self._residual_connections:
+    # Scale output to maintain magnitude
+    scale_factor = 1.0 / float(self._num_layers)
+    final_output = tf.reduce_mean(tf.stack(outputs, axis=0), axis=0)
+else:
+    # Just use the output from the last layer
+    final_output = outputs[-1]
+```
+
+Finally for **weight loading**, the original implementation loaded weights directly during initialization, hard-coding file paths and weight loading logic in the constructor (**lines 303-339**). Our refactored implementation provides a dedicated method for weight loading:
+```python
+def load_weights_from_numpy(self, load_path: str) -> None:
+    """
+    Load cell weights from numpy files.
+
+    Args:
+        load_path: Directory containing weight files
+    """
+    base_scope = "rnn_mlstm_stack_mlstm_stack"
+
+    # Load weights for each cell in the stack
+    for i, cell in enumerate(self._cells):
+        # ... weight mapping logic ...
+
+        # Load the weights into the cell
+        cell.load_weights_from_numpy(cell_path)
+```
+
 
 <a id="cell-tf-changes"></a>
 ### 🔄 Tensorflow API Changes
 
-The multiplicative LSTM (mLSTM) combines the benefits of LSTM cells with multiplicative RNN dynamics, allowing for stronger expressivity in sequence modeling. Here's how it works:
+| Original (TF 1.x) | Refactored (TF 2.x) | Component | Benefit |
+|-------------------|---------------------|-----------|---------|
+| `tf.nn.rnn_cell.RNNCell` | `tf.keras.layers.Layer` | Cell inheritance | Better integration with Keras ecosystem |
+| `tf.get_variable()` | `self.add_weight()` | Weight creation | Automatic variable tracking and serialization |
+| `zero_state()` | `get_initial_state()` | State initialization | Consistent with Keras RNN interfaces |
+| `tf.nn.l2_normalize(x, dim=0)` | `tf.nn.l2_normalize(x, axis=0)` | Weight normalization | Updated parameter naming |
+| `tf.split(z, 4, 1)` | `tf.split(z, 4, axis=1)` | Tensor splitting | Updated parameter naming |
+| `tf.contrib.data.TextLineDataset` | `tf.data.TextLineDataset` | Dataset creation | Moved from contrib to core API |
+| `tf.distributions.Categorical` | `tf.random.categorical` | Sampling | Updated to more stable implementation |
+| `tf.global_variables_initializer()` | N/A (eager execution) | Variable initialization | Automatic initialization in eager mode |
+| `sess.run()` | Direct tensor operations | Session execution | Eager execution eliminates session management |
+| Explicit `scope` parameter | `name` parameter | Variable naming | Aligns with Keras naming conventions |
+| `tf.contrib.rnn.DropoutWrapper` | `tf.keras.layers.Dropout` | Dropout application | Direct layer application instead of wrappers |
+| `group_by_window` for bucketing | Standard padding approach | Sequence batching | Simplified data pipeline |
+| `tf.scalar_mul` + `tf.add_n` | `tf.reduce_mean` | Residual connections | More efficient implementation |
+| No explicit training mode | `training` parameter | Training/inference | Proper behavior switching for regularization |
+| No explicit seeding | Seed parameters | Random operations | Deterministic results |
+| Hard-coded device placement | TF 2.x device placement | Hardware utilization | Better automatic device management |
+| `initialized_uninitialized()` | N/A | Variable initialization | No longer needed with eager execution |
 
-1. Standard LSTM Components:
+<a id="cell-testing"></a>
+### 🧪 Testing
 
-   - Cell state (c) - Long-term memory
+All refactored methods are unit tested by `test_cells.py`. The test can be run by `python3 -m tests.test_cells` at the project root level.
+```
+Running all cell tests...
 
-   - Hidden state (h) - Current output
-   - Gates: input (i), forget (f), output (o), and cell update (u)
+=== Testing BaseLSTMCell ===
+State size: (TensorShape([64]), TensorShape([64]))
+Output size: (64,)
+2025-04-06 14:03:48.982409: E external/local_xla/xla/stream_executor/cuda/cuda_driver.cc:152] failed call to cuInit: INTERNAL: CUDA error: Failed call to cuInit: UNKNOWN ERROR (303)
+Initial state shapes: [TensorShape([2, 64]), TensorShape([2, 64])]
+Normalized weight shape: (10, 64)
+BaseLSTMCell tests passed!
 
-2. Multiplicative Enhancement:
+=== Testing mLSTMCell ===
+Output shape: (2, 64)
+Next cell state shape: (2, 64)
+Next hidden state shape: (2, 64)
+Deterministic output: True
+mLSTMCell tests passed!
 
-   - Before applying the standard LSTM computation, mLSTM introduces a multiplicative interaction between the input and previous hidden state
-   - This creates a tensor product that allows for stronger, non-linear dependencies
+=== Testing mLSTMCell Weight Normalization ===
+Outputs with and without weight normalization are different: True
+mLSTMCell weight normalization tests passed!
 
-3. Core Computation:
+=== Testing mLSTMCell Weight Loading ===
+Successfully loaded weights
+Warning: Weight file /invalid/path/rnn_mlstm_mlstm_wx:0.npy not found
+Warning: Weight file /invalid/path/rnn_mlstm_mlstm_wh:0.npy not found
+Warning: Weight file /invalid/path/rnn_mlstm_mlstm_wmx:0.npy not found
+Warning: Weight file /invalid/path/rnn_mlstm_mlstm_wmh:0.npy not found
+Warning: Weight file /invalid/path/rnn_mlstm_mlstm_b:0.npy not found
+Warning: Weight file /invalid/path/rnn_mlstm_mlstm_gx:0.npy not found
+Warning: Weight file /invalid/path/rnn_mlstm_mlstm_gh:0.npy not found
+Warning: Weight file /invalid/path/rnn_mlstm_mlstm_gmx:0.npy not found
+Warning: Weight file /invalid/path/rnn_mlstm_mlstm_gmh:0.npy not found
+Handled invalid path correctly
+mLSTMCell weight loading tests passed!
 
-   - Multiplicative interaction: `m = (inputs · wmx) * (h_prev · wmh)`
-   - Combined input: `z = (inputs · wx) + (m · wh) + b`
-   - Gate activation: Split z into i, f, o, u and apply activation functions
-   - Cell update: `c = f * c_prev + i * u`
-   - Hidden update: `h = o * tanh(c)`
+=== Testing mLSTMCell Computational Correctness ===
+Output: [[0.2609468 0.2609468]]
+Next cell state: [[0.4105818 0.4105818]]
+Next hidden state: [[0.2609468 0.2609468]]
+mLSTMCell computational correctness tests passed!
 
-This architecture is particularly effective for protein sequences because:
+=== Testing mLSTMCell Edge Cases ===
+Output with zero inputs: [[0. 0. 0. 0.]
+ [0. 0. 0. 0.]]
+Warning: Cell produced output with NaN inputs
+mLSTMCell edge case tests passed!
 
-- The multiplicative interaction captures complex dependencies between amino acids
-- The cell state maintains information over long sequences
-- The architecture can model diverse structural and functional patterns in **proteins**
+=== Testing StackedMlstmCell ===
+Testing initialization...
+Testing initial state...
+Testing forward pass...
+Testing residual connections...
+Testing dropout...
+Testing deterministic behavior...
+Testing sequence processing...
+StackedMlstmCell tests passed!
 
-### Explanation
+✅ All tests passed!
+```
 
 [🔝 Back to Table of Contents](#toc)
-
-### mLSTM Cell Architecture
-
-The multiplicative Long Short-Term Memory (mLSTM) cell is a powerful variation of the standard LSTM that introduces multiplicative interactions. Let's explain how it works:
-
-#### Basic Components
-
-1. **Input (x)**: The current input to the cell
-2. **Hidden State (h)**: The previous output of the cell
-3. **Cell State (c)**: The internal memory of the cell
-
 
 <a id="entry-3"></a>
 ## Entry 3: Refactor UniRep 64 Unit Model
