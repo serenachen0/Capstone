@@ -39,7 +39,7 @@ Objective: refactor the UniRep model to ensure deterministic output and improve 
 
 ### [🧠 Entry 2: LSTM Cell Implementation](#entry-2)
 - [🎯 Goals](#cell-goals)
-- [Implementation Details](#cell-impl-0)
+- [⚙️ Implementation Details](#cell-impl-0)
   - [1️⃣ Base LSTM Cell Extraction & Refactoring](#cell-impl-1)
   - [2️⃣ New Methods for Determinstic Behavior and API Consistency](#cell-impl-2)
   - [3️⃣ Implement mLSTM Cell](#cell-impl-3)
@@ -1860,12 +1860,74 @@ Below is a summary of attributes and methods that were refactored into `BaseConf
 <a id="model-impl-2"></a>
 #### 2️⃣ Base Model Implementation
 
+After establishing a robust configuration system, the next step was to refactor the model architecture.
 
 
+In the original code, the model classes share significant functionality: `babbler256` and `babbler64` inheriting from `babbler1900` but overriding the constructor with different model configurations. These models use TensorFlow 1.x APIs (`tf.contrib`, `placeholders`, `sessions`).
 
-The three classes share significant functionality with `babbler256` and `babbler64` inheriting from `babbler1900` but overriding the constructor with different model configurations. These models use TensorFlow 1.x APIs (`tf.contrib`, `placeholders`, `sessions`).
+- `babbler1900` (**lines 393-674**): The largest model with 1900 units
+- `babbler256` (**lines 676-791**): Medium model with 256 units that inherits from babbler1900
+- `babbler64` (**lines 794-908**): Small model with 64 units that also inherits from babbler1900
 
-Our refactorization starts with creating a `BaseModel` class inherits from TensorFlow 2.x `tf.keras.Model`. This model serves as a foundation class that all babblers can inherit from.
+Despite the inheritance, `babbler256` and `babbler64` override the constructor with different model configurations rather than leveraging proper parameterization. All three models use TensorFlow 1.x APIs (`tf.contrib`, `placeholders`, `sessions`) that need modernization. Our refactorization creates a `BaseModel` class inherits from TensorFlow 2.x `tf.keras.Model`. This model serves as a foundation class that all babblers can inherit from.
+
+Starting with **constructor implemention**, original code from `babbler1900` constructor (**lines 395-473**) exhibits several architectural limitations that hinder maintainability and flexibility:
+- It directly hardcodes model parameters (**lines 395-405**) like RNN size (`self._rnn_size = 1900`) and embedding dimensions (`_self.embed_dim = 10`) with minimal parameterization, making it difficult to create model variants without code duplication.
+- It intertwines configuration with model construction, leading to `babbler256` (**lines 681-692**) and `babbler64` (**lines 799-810**) overriding most of the constructor code just to change a few parameter values.
+- This approach lacks modern features like deterministic seeding and type safety, while forcing subclasses to reimplement common functionality rather than extend it in a clean hierarchy.
+```python
+# lines 395-405
+def __init__(self,
+    model_path="./pbab_weights",
+    batch_size=256
+    ):
+    # hard coded model parameters
+    self._rnn_size = 1900
+    self._vocab_size = 26
+    self._embed_dim = 10
+    self._wn = True
+    self._shuffle_buffer = 10000
+    self._model_path = model_path
+    self._batch_size = batch_size
+# ...
+# lines 681-692
+def __init__(self,
+    model_path="./256_weights/",
+    batch_size=256
+    ):
+     # Override parent constructor just to change RNN size
+    self._rnn_size = 256 # Hardcoded size change
+    self._vocab_size = 26
+    self._embed_dim = 10
+    self._num_layers = 4
+    self._wn = True
+    self._shuffle_buffer = 10000
+    self._model_path = model_path
+    self._batch_size = batch_size
+# ...
+# lines 799-810
+def __init__(self,
+    model_path="./64_weights/",
+    batch_size=256
+    ):
+     # Override parent constructor just to change RNN size
+    self._rnn_size = 64 # Hardcoded size change
+    self._vocab_size = 26
+    self._embed_dim = 10
+    self._num_layers = 4
+    self._wn = True
+    self._shuffle_buffer = 10000
+    self._model_path = model_path
+    self._batch_size = batch_size
+```
+Our refactored `BaseModel` constructor improves on the following aspects:
+- uses configuration object `UniRepModelConfig` instead of individual parameters.
+- Adds explicit random seed setting for deterministic behavior
+- Uses `tf.keras.layers.Embedding` instead of raw tensor operations
+- Uses `tf.keras.layers.Dense` for output projection
+- Explicit weight loading with error checking
+- Type annotations for better code safety
+
 ```python
 def __init__(
     self,
@@ -1891,13 +1953,298 @@ def __init__(
     if config.seed is not None:
         tf.random.set_seed(config.seed)
         np.random.seed(config.seed)
-    # ...
+
+    # Create the embedding layer
+    self.embedding = tf.keras.layers.Embedding(
+        input_dim=self._vocab_size,
+        output_dim=self._embed_dim,
+        name="aa_embedding"
+    )
+
+    # Initialize with the weights specified in config if provided
+    if config.model_path and os.path.exists(os.path.join(config.model_path, "embed_matrix:0.npy")):
+        embed_weights = np.load(os.path.join(config.model_path, "embed_matrix:0.npy"))
+        self.embedding.build((None,))
+        self.embedding.set_weights([embed_weights])
+
+    # Output projection for aa prediction (for babbling)
+    self.output_projection = tf.keras.layers.Dense(
+        units=self._vocab_size - 1,  # -1 because we don't predict the start token
+        name="output_projection"
+    )
+
+    # Initialize with the weights specified in config if provided
+    if config.model_path:
+        weights_path = os.path.join(config.model_path, "fully_connected_weights:0.npy")
+        bias_path = os.path.join(config.model_path, "fully_connected_biases:0.npy")
+
+        if os.path.exists(weights_path) and os.path.exists(bias_path):
+            weights = np.load(weights_path)
+            biases = np.load(bias_path)
+            self.output_projection.build((None, config.rnn_size))
+            self.output_projection.set_weights([weights, biases])
+
+    # Cell initialization is left to subclasses since it varies by model
 ```
-In the original implemmentation, configuration parameters for the models were directly embedded within the model code.
+
+For **forward pass implementation**, the original code in `babbler1900` class used TensorFlow 1.x's session-based graph execution model, with placeholders and explicit session management for the forward pass. This approach had the following limitations: the forward pass logic was split across multiple methods, relying on numerous placeholders, and requiring explicit session management for each computation.
 
 ```python
+# Lines 406-421 (Placeholder definitions)
+self._batch_size_placeholder = tf.placeholder(tf.int32, shape=[], name="batch_size")
+self._minibatch_x_placeholder = tf.placeholder(tf.int32, shape=[None, None], name="minibatch_x")
+# ... more placeholders ...
 
+# Lines 434-444 (Graph construction in constructor)
+embed_matrix = tf.get_variable(...)
+embed_cell = tf.nn.embedding_lookup(embed_matrix, self._minibatch_x_placeholder)
+self._output, self._final_state = tf.nn.dynamic_rnn(...)
+
+# Lines 504-515 (get_rep method)
+with tf.Session() as sess:
+    initialize_uninitialized(sess)
+    final_state_, hs = sess.run(
+        [self._final_state, self._output], feed_dict={...}
+    )
 ```
+Our refactored implementation adopts TensorFlow 2.x's eager execution model with a Keras-style `call()` method. This method in the `BaseModel` provides common embedding logic but leaves RNN cell-specific processing to subclasses, allowing different model variants to specialize appropriately while maintaining a consistent interface:
+
+```python
+def call(
+        self,
+        inputs: tf.Tensor,
+        initial_state: Optional[Tuple] = None,
+        training: bool = False,
+        return_state: bool = False
+    ) -> Union[tf.Tensor, Tuple[tf.Tensor, Tuple]]:
+        """
+        Forward pass for the model.
+
+        Args:
+            inputs: Input tensor of token IDs [batch_size, seq_len]
+            initial_state: Optional initial state for the RNN
+            training: Whether in training mode
+            return_state: Whether to return final state
+
+        Returns:
+            If return_state is False, returns output tensor [batch_size, seq_len, num_units]
+            If return_state is True, returns (output, final_state)
+        """
+        # This is a base implementation to be overridden by subclasses
+        # Embed the inputs
+        embedded = self.embedding(inputs)
+
+        # The RNN processing is implemented by subclasses
+        raise NotImplementedError("Subclasses must implement the call method")
+```
+The original code implemented **representation extraction** in the `get_rep()` methods (**lines 497-524**, **763-791**, **881-908**), with significant code duplication across model variants. Each model required creating new sessions for every sequence and used awkward feed dictionary patterns:
+```python
+# lines 497-524
+def get_rep(self, seq):
+    ...
+    with tf.Session() as sess:
+        initialize_uninitialized(sess)
+    int_seq = aa_seq_to_int(seq.strip())[:-1]
+    final_state_, hs = sess.run(
+        [self._final_state, self._output], feed_dict={
+            self._batch_size_placeholder: 1,
+            self._minibatch_x_placeholder: [int_seq],
+            self._initial_state_placeholder: self._zero_state}
+    )
+```
+Our refactored implementation unifies this functionality in a clean, resuable method. This approach eliminates session management overhead, simplifies the interface, and delegates state processing to model-specific implementations through the abstract `_process_final_state()` method.
+
+```python
+def get_representation(self, sequence: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Get representation for a protein sequence.
+
+    Args:
+        sequence: Amino acid sequence
+
+    Returns:
+        Tuple of (avg_hidden, final_hidden, final_cell)
+    """
+    # Convert sequence to token IDs
+    sequence = sequence.strip()
+    seq_ids = aa_seq_to_int(sequence, include_stop=False)
+
+    # Add batch dimension and process through model
+    inputs = tf.convert_to_tensor([seq_ids], dtype=tf.int32)
+
+    # Get initial state for a batch size of 1
+    initial_state = self.get_initial_state(batch_size=1)
+
+    # Forward pass with state
+    outputs, final_state = self(
+        inputs=inputs,
+        initial_state=initial_state,
+        training=False,
+        return_state=True
+    )
+
+    # Process outputs for representation
+    # Outputs shape: [1, seq_len, rnn_size]
+    outputs = outputs.numpy()[0]  # Remove batch dimension
+
+    # Get average hidden state
+    avg_hidden = np.mean(outputs, axis=0)
+
+    # Get final hidden and cell states (specific implementation depends on model)
+    final_hidden, final_cell = self._process_final_state(final_state)
+
+    return avg_hidden, final_hidden, final_cell
+```
+
+The original code implemented **sequence generation** in `get_babble()` method (**lines 526-563**) which suffered from non-deterministic behavior and inefficient session management:
+
+```python
+# Original implementation (lines 526-563)
+with tf.Session() as sess:
+    initialize_uninitialized(sess)
+    # Process seed sequence
+    seed_samples, final_state_ = sess.run(
+        [self._sample, self._final_state],
+        feed_dict={
+            self._minibatch_x_placeholder: [int_seed],
+            self._initial_state_placeholder: self._zero_state,
+            self._batch_size_placeholder: 1,
+            self._temp_placeholder: temp
+        }
+    )
+    # Then repeatedly run sessions for each new token
+    for i in range(length - len(seed)):
+        pred_int, final_state_ = sess.run(
+            [self._sample, self._final_state],
+            feed_dict={...}
+        )
+```
+
+Our refactored implementation provides deterministic sequence generation through a clean, eager execution approach  by reusing state across iterations and ensures deterministic behavior through controlled sampling.
+```python
+def generate_sequence(
+    self,
+    seed: str,
+    length: int = 250,
+    temperature: float = 1.0
+) -> str:
+    """
+    Generate a sequence starting with seed.
+
+    Args:
+        seed: Seed sequence
+        length: Total length of sequence to generate
+        temperature: Sampling temperature (0-1, lower = more conservative)
+
+    Returns:
+        Generated sequence
+    """
+    # Initial sequence
+    sequence = seed.strip()
+
+    # Convert to token IDs
+    seq_ids = aa_seq_to_int(sequence, include_stop=False)
+
+    # Get initial state
+    state = self.get_initial_state(batch_size=1)
+
+    # Generate one token at a time
+    while len(sequence) < length:
+        # Prepare input
+        inputs = tf.convert_to_tensor([seq_ids], dtype=tf.int32)
+
+        # Forward pass
+        outputs, state = self(
+            inputs=inputs,
+            initial_state=state,
+            training=False,
+            return_state=True
+        )
+
+        # Get logits for the last token
+        logits = outputs[0, -1, :]
+
+        # Sample next token
+        next_token = self._sample_with_temperature(logits, temperature)
+
+        # Convert token to amino acid and add to sequence
+        next_aa = int_to_aa[next_token + 1]
+        sequence += next_aa
+
+        # Update sequence IDs with only the new token for the next iteration
+        seq_ids = [next_token + 1]
+
+    return sequence
+```
+
+We implemented two **utility methods** to centralize functionality that was previously scattered or duplicated in the original code. These methods provide consistent interfaces with improved error handling and deterministic behavior:
+```python
+def _sample_with_temperature(self, logits: tf.Tensor, temperature: float) -> int:
+    """
+    Sample from logits with temperature.
+
+    Args:
+        logits: Logits tensor
+        temperature: Sampling temperature (0-1, lower = more conservative)
+
+    Returns:
+        Sampled token ID
+    """
+    # Adjust logits by temperature
+    logits = logits / max(temperature, 1e-8)
+
+    # Apply softmax to get probabilities
+    probabilities = tf.nn.softmax(logits)
+
+    # Sample from categorical distribution
+    sample = tf.random.categorical(
+        tf.math.log(probabilities + 1e-8)[tf.newaxis],
+        num_samples=1,
+        seed=self.config.seed
+    )
+
+    return sample[0, 0].numpy()
+
+def is_valid_sequence(self, sequence: str, max_len: int = 2000) -> bool:
+    """
+    Check if sequence is valid for the model.
+
+    Args:
+        sequence: Amino acid sequence
+        max_len: Maximum allowed length
+
+    Returns:
+        Whether the sequence is valid
+    """
+    length = len(sequence)
+    valid_aas = set("MRHKDESTNQCUGPAVIFYWLO")
+
+    return (length <= max_len) and set(sequence).issubset(valid_aas)
+```
+Finally, for **weight management**, we implemented a consistent weight saving mechanism to replace the original, model-specific weight handling:
+```python
+def save_weights_to_numpy(self, save_path: str) -> None:
+    """
+    Save model weights to numpy files for compatibility.
+
+    Args:
+        save_path: Directory to save weights
+    """
+    os.makedirs(save_path, exist_ok=True)
+
+    # Save embedding weights
+    np.save(os.path.join(save_path, "embed_matrix:0.npy"), self.embedding.get_weights()[0])
+
+    # Save output projection weights
+    weights, biases = self.output_projection.get_weights()
+    np.save(os.path.join(save_path, "fully_connected_weights:0.npy"), weights)
+    np.save(os.path.join(save_path, "fully_connected_biases:0.npy"), biases)
+
+    # Cell weights are saved by subclasses
+```
+
+#### 3️⃣ Specific Model Implementations
+
 
 
 
