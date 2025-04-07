@@ -46,8 +46,13 @@ Objective: refactor the UniRep model to ensure deterministic output and improve 
   - [4️⃣ Stacked mLSTM Cell Implementation](#cell-impl-4)
 - [🔄 TensorFlow API Changes](#cell-tf-changes)
 - [🧪 Testing](#cell-testing)
-### [Entry 3: Refactor Model](#entry-3)
-
+### [🧩 Entry 3: Refactor Model Architecture](#entry-3)
+- [🎯 Goals](#model-goals)
+- [⚙️ Implementation Details](#model-impl-0)
+    - [1️⃣ Base Configuration Implementation](#model-impl-1)
+    - [2️⃣ Base Model Implementation](#model-impl-2)
+- [🔄 Tensorflow API Changes](#model-tf-changes)
+- [🧪 Testing](#model-testing)
 
 <a id="entry-0"></a>
 ## 📋 Entry 0: Project Analysis and Planning
@@ -1691,4 +1696,215 @@ StackedMlstmCell tests passed!
 [🔝 Back to Table of Contents](#toc)
 
 <a id="entry-3"></a>
-## Entry 3: Refactor UniRep 64 Unit Model
+## 🧩 Entry 3: Refactor Model Architecture
+
+<a id="model-goals"></a>
+### 🎯 Goals
+
+- Refactor model implementations from TensorFlow 1.3 to 2.x API
+- Centralize configuration management with validation
+- Create a clear class hierarchy for model variants
+- Maintain compatibility with original model weights
+- Enable deterministic behavior
+- Improve code organization and reusability
+
+<a id="model-impl-0"></a>
+### ⚙️ Implementation Details
+
+<a id="model-impl-1"></a>
+#### 1️⃣ Base Configuration Implementation
+
+The first step in our refactoring was to create a configuration system to centralize and validate all model parameters. This addressed several architectural goals:
+- **Code Organization**: Separate configuration from implementation
+- **Parameter Validation**: Prevent invalid configurations
+- **Reproducibility**: Enable saving and loading of model configurations
+
+Analysis of the original `unirep.py` reveals scattered configuration across three model classes:
+
+- `babbler1900` (**lines 393-674**): the largest model with 1900 units with hardcoded parameters with limited configurability
+- `babbler256` (**lines 676-791**): a medium model with 256 units with duplicated initialization with different values
+- `babbler64` (**lines 794-908**): the smallest model with 64 units with further duplication with minimal unique code
+
+Our implementation adopts a two-level configuration hierarchy in `config/model_config.py`:
+- `BaseConfig`: A generic configuration class that provides core functionality like validation, serialization, and deserialization. This class serves as a foundation for all configuration types in the project, enabling a consistent interface and reducing code duplication.
+- `UniRepModelConfig`: A specific configuration class for UniRep models that defines and validates model-specific parameters.
+
+This two-level configuration hierarchy enhances the codebase architecture by separating generic functionality in `BaseConfig` from model-specific parameters in `UniRepModelConfig`. This approach facilitates easy expansion to new configuration types while maintaining a consistent interface for validation, saving, and loading operations. By centralizing serialization logic, we improve maintainability and reduce redundancy across the implementation.
+```python
+# config/model_config.py
+from typing import Optional, Dict, Any
+import os
+import json
+
+class BaseConfig:
+    """Base configuration with validation and serialization"""
+
+    def __init__(self, **kwargs: Any):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+    def validate(self) -> bool:
+        """Validate configuration."""
+        return True
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert config to dictionary."""
+        return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
+
+    def save(self, path: str) -> None:
+        """Save config to JSON file."""
+        with open(path, 'w') as f:
+            json.dump(self.to_dict(), f, indent=2)
+
+    @classmethod
+    def from_dict(cls, config_dict: Dict[str, Any]) -> 'BaseConfig':
+        """Create config from dictionary."""
+        return cls(**config_dict)
+
+    @classmethod
+    def load(cls, path: str) -> 'BaseConfig':
+        """Load config from JSON file."""
+        with open(path, 'r') as f:
+            config_dict = json.load(f)
+        return cls.from_dict(config_dict)
+
+class UniRepModelConfig(BaseConfig):
+    """Configuration for UniRep models."""
+
+    def __init__(
+        self,
+        rnn_size: int = 64,
+        embed_dim: int = 10,
+        num_layers: int = 4,
+        weight_norm: bool = True,
+        model_path: Optional[str] = None,
+        batch_size: int = 256,
+        seed: Optional[int] = None,
+        dropout_rate: Optional[float] = None,
+        residual_connections: bool = False,
+        **kwargs: Any
+    ):
+        """
+        Initialize UniRep model configuration.
+
+        Args:
+            rnn_size: Number of units in RNN cell
+            embed_dim: Dimension of embedding layer
+            num_layers: Number of layers in stacked model
+            weight_norm: Whether to use weight normalization
+            model_path: Path to pretrained weights
+            batch_size: Default batch size
+            seed: Random seed for deterministic behavior
+            dropout_rate: Optional dropout rate
+            residual_connections: Whether to use residual connections
+        """
+        self.rnn_size = rnn_size
+        self.embed_dim = embed_dim
+        self.num_layers = num_layers
+        self.weight_norm = weight_norm
+        self.model_path = model_path
+        self.batch_size = batch_size
+        self.seed = seed
+        self.dropout_rate = dropout_rate
+        self.residual_connections = residual_connections
+        super(UniRepModelConfig, self).__init__(**kwargs)
+
+    def validate(self) -> bool:
+        """Validate UniRep model configuration."""
+        # Validate RNN size
+        if self.rnn_size <= 0:
+            raise ValueError(f"rnn_size must be positive, got {self.rnn_size}")
+
+        # Validate embedding dimension
+        if self.embed_dim <= 0:
+            raise ValueError(f"embed_dim must be positive, got {self.embed_dim}")
+
+        # Validate number of layers
+        if self.num_layers <= 0:
+            raise ValueError(f"num_layers must be positive, got {self.num_layers}")
+
+        # Validate batch size
+        if self.batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {self.batch_size}")
+
+        # Validate dropout rate
+        if self.dropout_rate is not None and (self.dropout_rate < 0 or self.dropout_rate >= 1):
+            raise ValueError(f"dropout_rate must be in [0, 1), got {self.dropout_rate}")
+
+        # Validate model path
+        if self.model_path is not None and not os.path.exists(self.model_path):
+            raise ValueError(f"model_path does not exist: {self.model_path}")
+
+        return True
+```
+
+Below is a summary of attributes and methods that were refactored into `BaseConfig` and `UniRepModelConfig`:
+| **Attribute/Method**       | **Origin in `unirep.py`**                                                                 | **Purpose**                                                                 |
+|----------------------------|------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------|
+| `rnn_size`                 | `self._rnn_size` in `babbler1900` (**line 399**), `babbler256` (**line 685**), `babbler64` (**line 803**)        | Number of units in the RNN cell.                                          |
+| `embed_dim`                | `self._embed_dim` in `babbler1900` (**line 401**) and `babbler256` (**line 687**), `babbler64` (**line 805**)       | Dimension of the embedding layer.                                          |
+| `num_layers`               | `self._num_layers` in `babbler256` (**line 688**) and `babbler64` (**line 806**)         | Number of layers in the stacked model.                                     |
+| `weight_norm`              | `self._wn` in `babbler1900` (**line 402**), `babbler256` (**line 691**), `babbler64` (**line 807**)               | Whether to use weight normalization.                                       |
+| `model_path`               | `self._model_path` in `babbler1900` (**line 404**), `babbler256` (**line 677**), `babbler64` (**line 809**)       | Path to pretrained weights.                                                |
+| `batch_size`               | `self._batch_size` in `babbler1900` (**line 405**), `babbler256` (**line 692**), `babbler64` (**line 810**)      | Default batch size.                                                        |
+| `dropout_rate`             | Derived from `mLSTMCellStackNPY` (**lines 341-343**)                                     | Optional dropout rate for regularization.                                  |
+| `residual_connections`     | Derived from `mLSTMCellStackNPY` (**lines 383-388**)                                     | Whether to use residual connections.                                       |
+| `validate()`               | Derived from hardcoded parameter logic in `unirep.py`                                    | Validates configuration parameters.                                        |
+| `seed`                     | **New** | Random seed for deterministic behavior.                                    |
+| `to_dict()`                | **New**                                                                                 | Converts configuration to a dictionary.                                    |
+| `save()`                   | **New**                                                                                 | Saves configuration to a JSON file.                                        |
+| `from_dict()`              | **New**                                                                                 | Creates configuration from a dictionary.                                   |
+| `load()`                   | **New**                                                                                 | Loads configuration from a JSON file.                                      |
+
+
+<a id="model-impl-2"></a>
+#### 2️⃣ Base Model Implementation
+
+
+
+
+The three classes share significant functionality with `babbler256` and `babbler64` inheriting from `babbler1900` but overriding the constructor with different model configurations. These models use TensorFlow 1.x APIs (`tf.contrib`, `placeholders`, `sessions`).
+
+Our refactorization starts with creating a `BaseModel` class inherits from TensorFlow 2.x `tf.keras.Model`. This model serves as a foundation class that all babblers can inherit from.
+```python
+def __init__(
+    self,
+    config: UniRepModelConfig,
+    name: str = "unirep_base",
+    **kwargs: Any
+    ):
+    """
+    Initialize the base model with configuration.
+
+    Args:
+        config: Configuration for the model
+        name: Name of the model
+    """
+    super(BaseModel, self).__init__(name=name, **kwargs)
+    self.config = config
+
+    # Common attributes for all models
+    self._vocab_size = 26  # 20 standard AAs + special tokens
+    self._embed_dim = config.embed_dim
+
+    # Set random seed for deterministic behavior
+    if config.seed is not None:
+        tf.random.set_seed(config.seed)
+        np.random.seed(config.seed)
+    # ...
+```
+In the original implemmentation, configuration parameters for the models were directly embedded within the model code.
+
+```python
+
+```
+
+
+
+<a id="model-tf-changes"></a>
+### 🔄 Tensorflow API Changes
+
+<a id="model-testing"></a>
+### 🧪 Testing
+
+[🔝 Back to Table of Contents](#toc)
