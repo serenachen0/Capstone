@@ -51,6 +51,7 @@ Objective: refactor the UniRep model to ensure deterministic output and improve 
 - [⚙️ Implementation Details](#model-impl-0)
     - [1️⃣ Base Configuration Implementation](#model-impl-1)
     - [2️⃣ Base Model Implementation](#model-impl-2)
+    - [3️⃣ Specific Model Implementations](#model-impl-3)
 - [🔄 Tensorflow API Changes](#model-tf-changes)
 - [🧪 Testing](#model-testing)
 
@@ -2243,15 +2244,205 @@ def save_weights_to_numpy(self, save_path: str) -> None:
     # Cell weights are saved by subclasses
 ```
 
+<a id="model-impl-3"></a>
 #### 3️⃣ Specific Model Implementations
 
+After establishing the base model architecture, the next step is to implement the specific UniRep model variants. The original code had three distinct model sizes:
 
+- `babbler1900`: The largest model with 1900 units per LSTM cell
+- `babbler256`: A medium-sized model with 256 units and 4 stacked layers
+- `babbler64`: A smaller model with 64 units and 4 stacked layers
 
+Each model shares the same architecture with different parameter sizes. Our refactored implementation creates three concrete model classes that inherit from `BaseModel`: `unirep1900`, `unirep256`, `unirep64`:
+```python
+# models/unirep1900.py
+class UniRep1900(BaseModel):
+    def __init__(
+        self,
+        config: Optional[UniRepModelConfig] = None,
+        **kwargs: Any
+    ):
+        """
+        Initialize UniRep1900 model.
+
+        Args:
+            config: Configuration for the model
+            **kwargs: Additional arguments for BaseModel
+        """
+        # Create config if not provided
+        if config is None:
+            config = UniRepModelConfig(
+                rnn_size=1900,
+                embed_dim=10,
+                num_layers=1,
+                weight_norm=True,
+                **kwargs
+            )
+        else:
+            # Override config with correct RNN size
+            config.rnn_size = 1900
+            config.num_layers = 1
+
+        # Validate configuration
+        config.validate()
+
+        super(UniRep1900, self).__init__(config=config, name="unirep1900", **kwargs)
+
+        # Create the mLSTM cell
+        self.cell = mLSTMCell(
+            num_units=self.config.rnn_size,
+            weight_norm=self.config.weight_norm,
+            seed=self.config.seed,
+            name="mlstm_1900"
+        )
+
+        # Load weights if provided
+        if self.config.model_path:
+            self._build_and_load_weights().
+
+# models/unirep256.py
+class UniRep256(BaseModel):
+    ...
+
+# models/unirep64.py
+class UniRep64(BaseModel):
+```
+The implementation of `UniRep256` and `UniRep64` follows a similar pattern, with the key difference being the use of stacked mLSTM cells. Each model implements the abstract `call()` methods from `BaseModel`. The implementation for `_process_final_state` differs between the single-cell model `UniRep1900` and the stacked models `UniRep256` and `UniRep64`:
+```python
+def call(
+    self,
+    inputs: tf.Tensor,
+    initial_state: Optional[Tuple] = None,
+    training: bool = False,
+    return_state: bool = False
+) -> Union[tf.Tensor, Tuple[tf.Tensor, Tuple]]:
+    """
+    Forward pass for the model.
+
+    Args:
+        inputs: Input tensor of token IDs [batch_size, seq_len]
+        initial_state: Optional initial state for the RNN
+        training: Whether in training mode
+        return_state: Whether to return final state
+
+    Returns:
+        If return_state is False, returns output tensor [batch_size, seq_len, num_units]
+        If return_state is True, returns (output, final_state)
+    """
+    # Embed the inputs
+    embedded = self.embedding(inputs)
+
+    # Use initial_state if provided, otherwise get default initial state
+    if initial_state is None:
+        initial_state = self.get_initial_state(tf.shape(inputs)[0])
+
+    # Process through RNN
+    outputs, final_state = tf.keras.layers.RNN(
+        self.cell,
+        return_sequences=True,
+        return_state=True,
+        name="rnn"
+    )(embedded, initial_state=initial_state, training=training)
+
+    # Apply output projection for token prediction
+    logits = self.output_projection(outputs)
+
+    if return_state:
+        return outputs, final_state
+    else:
+        return outputs
+
+def get_initial_state(self, batch_size: int) -> Tuple:
+    """
+    Get initial state for the RNN.
+
+    Args:
+        batch_size: Batch size
+
+    Returns:
+        Initial state tuple
+    """
+    return self.cell.get_initial_state(batch_size=batch_size, dtype=tf.float32)
+
+def _process_final_state(self, state: Tuple) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Process final state to extract hidden and cell representations.
+
+    Args:
+        state: Final RNN state
+
+    Returns:
+        Tuple of (final_hidden, final_cell) as numpy arrays
+    """
+    # For UniRep1900, state is (cell_state, hidden_state)
+    cell_state, hidden_state = state
+
+    # Convert to numpy and remove batch dimension
+    return hidden_state[0].numpy(), cell_state[0].numpy()
+```
+
+Each model also implements weight loading with a private method:
+
+```python
+def _build_and_load_weights(self) -> None:
+    """Build the model and load weights from the specified path."""
+    # Build the cell with a dummy input to initialize weights
+    dummy_input = tf.zeros((1, 1, self._embed_dim))
+    dummy_state = self.get_initial_state(batch_size=1)
+    self.cell(dummy_input, dummy_state)
+
+    # Load cell weights
+    self.cell.load_weights_from_numpy(self.config.model_path)
+
+    # The embedding and output projection weights are loaded in the BaseModel constructor
+```
 
 <a id="model-tf-changes"></a>
 ### 🔄 Tensorflow API Changes
+| Original (TF 1.x) | Refactored (TF 2.x) | Component | Benefit |
+|-------------------|---------------------|-----------|---------|
+| Class inheritance | `tf.keras.Model` | Model structure | Integration with Keras ecosystem |
+| Placeholder-based | Input parameters | Model inputs | Simplified interface with eager execution |
+| `tf.Session()` | Eager execution | Execution model | Direct tensor manipulation without sessions |
+| Manual graph construction | `tf.keras.layers.RNN` | RNN processing | Simplified high-level API |
+| Session-based generation | Step-by-step generation | Sequence generation | More efficient and cleaner implementation |
+| Variable scopes | Variable naming | Weight organization | Better compatibility with saved models |
+| Custom weight saving | `model.save_weights()` | Model persistence | Integration with TensorFlow saving |
+| Hardcoded parameters | Configuration object | Model configuration | Centralized parameter management |
+
+
 
 <a id="model-testing"></a>
 ### 🧪 Testing
+
+All refactored methods are unit tested by `test_model.py`. The test can be run by `python3 -m tests.test_model` at the project root level.
+```
+Testing forward pass with state...
+Model forward pass tests passed!
+
+=== Testing Model Representation Generation ===
+Getting representation for sequence: MASKGEELFT
+Checking deterministic behavior...
+Model representation tests passed!
+
+=== Testing Sequence Generation ===
+Testing sampling determinism...
+Sample 1: 6
+Sample 2: 6
+Sampling is deterministic. Sequence generation test passed!
+Generating sequences...
+Generated sequence 1: MASIIIIIII
+Generated sequence 2: MASIIIIIII
+Generated sequence with different temperature: MASIIIIIII
+Sequence generation tests passed!
+
+=== Testing Weight Loading ===
+Creating mock weights in /tmp/tmp_269dgwm
+Creating model with mock weights...
+Testing representation with loaded weights for sequence: MASKGEEL
+Weight loading tests passed!
+
+✅ All tests passed!
+```
 
 [🔝 Back to Table of Contents](#toc)
