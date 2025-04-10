@@ -20,4 +20,10 @@ Three python scripts are provided:
 
     Example: python reps-compare.py examples/outputs/5y0m_round1.h5 examples/outputs/5y0m_round2.h5
 
-Currently, the sequence to mLSTM representation conversion is non-deterministic and quite slow. The three example outputs, examples/outputs/5y0m_round[1/2/3].h5, were computed using the pre-trained 1900-unit model (1900_weights) on the same example protein seqeuence (examples/inputs/5y0m.fasta), but the results are not identical. Moreover, it took ~1 second to convert one sequence with 6 Intel Xeon CPUs and 1 Nvidia V100 GPU. The goal of this project is to investigate the robustness and throughput of this model and to modify the model so that it is deterministic and scalable. 
+Currently, the sequence to mLSTM representation conversion is non-deterministic and quite slow. The three example outputs, examples/outputs/5y0m_round[1/2/3].h5, were computed using the pre-trained 1900-unit model (1900_weights) on the same example protein seqeuence (examples/inputs/5y0m.fasta), but the results are not identical (Figure 1). Moreover, it took ~1 second to convert one sequence with 6 Intel Xeon CPUs and 1 Nvidia V100 GPU (Figure 2). The goal of this project is to investigate the robustness and throughput of this model and to modify the model so that it is deterministic and scalable. 
+
+![reproducibility](https://github.com/user-attachments/assets/1d72af83-0455-4008-9176-e6fbf8a01a7f)
+Figure 1: The mLSTM model (left) extracts different features for the same sequences, i.e., the results are not reproducible compared to an ideal model (right) which is reproducible.
+
+![scalability](https://github.com/user-attachments/assets/9e7969c0-303b-4c40-8d1d-847f89a2ea74)
+Figure 2: The mLSTM model takes ~1 second to extract features of one protein sequence, compared to ~0.04 seconds/sequence by a Transformer-based model.
