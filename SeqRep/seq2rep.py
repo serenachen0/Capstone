@@ -14,9 +14,10 @@ tf.set_random_seed(42)
 np.random.seed(42)
 
 # Import the mLSTM babbler model
-from unirep import babbler64 as babbler # 64-unit version
+#from unirep import babbler64 as babbler # 64-unit version
 # from unirep import babbler256 as babbler
 # from unirep import babbler1900 as babbler
+from unirep import babbler64, babbler256, babbler1900
 
 def create_parser():
     """
@@ -90,7 +91,12 @@ def run(args):
     model_weights = args.model # Model weights path
     outfl = args.outrep # Output file path
     verbose = args.verbose # Verbose option for detailed logging
-
+    if "64" in model_weights:
+        babbler = babbler64
+    elif "256" in model_weights:
+        babbler = babbler256
+    else:
+        babbler = babbler1900
     # check input files exist
     if not os.path.exists(seqfl):
         raise FileNotFoundError(f"Input FASTA file not found: {seqfl}")
