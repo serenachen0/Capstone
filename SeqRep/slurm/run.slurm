@@ -11,6 +11,9 @@
 source ~/.bashrc
 conda activate seqrep_gpu
 
+# 切換到專案根目錄
+cd /home/ko.hs/projects/Capstone/SeqRep
+
 # check if GPU available
 echo "=== GPU Check ==="
 nvidia-smi
@@ -18,27 +21,26 @@ nvidia-smi
 # check TensorFlow see if we use GPU
 python -c "import tensorflow as tf; print('GPU available:', tf.test.is_gpu_available())"
 
-
 # Run with 1900
 echo "=== Starting 1900 weights ==="
-python seq2rep.py ../examples/inputs/random_100.fasta ../1900_weights ../examples/outputs/random_100_run5_1900.h5
-python seq2rep.py ../examples/inputs/random_100.fasta ../1900_weights ../examples/outputs/random_100_run6_1900.h5
+python seq2rep.py examples/inputs/random_100.fasta ./1900_weights examples/outputs/random_100_run5_1900.h5
+python seq2rep.py examples/inputs/random_100.fasta ./1900_weights examples/outputs/random_100_run6_1900.h5
 
 # compare 1900
-python reps-compare.py ../examples/outputs/random_100_run5_1900.h5 ../examples/outputs/random_100_run6_1900.h5
+python scripts/reps-compare.py examples/outputs/random_100_run5_1900.h5 examples/outputs/random_100_run6_1900.h5
 
 # Run with 256
 echo "=== Starting 256 weights ==="
-python seq2rep.py ../examples/inputs/random_100.fasta ../256_weights ../examples/outputs/random_100_run3_256.h5
-python seq2rep.py ../examples/inputs/random_100.fasta ../256_weights ../examples/outputs/random_100_run4_256.h5
+python seq2rep.py examples/inputs/random_100.fasta ./256_weights examples/outputs/random_100_run3_256.h5
+python seq2rep.py examples/inputs/random_100.fasta ./256_weights examples/outputs/random_100_run4_256.h5
 
 # compare 256
-python reps-compare.py ../examples/outputs/random_100_run3_256.h5 ../examples/outputs/random_100_run4_256.h5
+python scripts/reps-compare.py examples/outputs/random_100_run3_256.h5 examples/outputs/random_100_run4_256.h5
 
 # Run with 64
 echo "=== Starting 64 weights ==="
-python seq2rep.py ../examples/inputs/random_100.fasta ../64_weights ../examples/outputs/random_100_run3_64.h5
-python seq2rep.py ../examples/inputs/random_100.fasta ../64_weights ../examples/outputs/random_100_run4_64.h5
+python seq2rep.py examples/inputs/random_100.fasta ./64_weights examples/outputs/random_100_run3_64.h5
+python seq2rep.py examples/inputs/random_100.fasta ./64_weights examples/outputs/random_100_run4_64.h5
 
 # compare 64
-python reps-compare.py ../examples/outputs/random_100_run3_64.h5 ../examples/outputs/random_100_run4_64.h5
+python scripts/reps-compare.py examples/outputs/random_100_run3_64.h5 examples/outputs/random_100_run4_64.h5
