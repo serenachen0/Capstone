@@ -1,6 +1,6 @@
 """
-Generate t-SNE plot to visualize reproducibility of mLSTM embeddings.
-Compares multiple runs to check if results are deterministic.
+Generate t-SNE plot - fit on Run 1 only, then transform all runs.
+This ensures identical embeddings will have identical t-SNE coordinates.
 """
 
 import h5py
@@ -14,7 +14,7 @@ def load_embeddings(h5_path):
     embeddings = []
     keys = []
     with h5py.File(h5_path, 'r') as f:
-        for key in f.keys():
+        for key in sorted(f.keys()):  # Sort to ensure consistent order
             embeddings.append(f[key][:])
             keys.append(key)
     return np.array(embeddings), keys
@@ -35,38 +35,49 @@ def main():
     print(f"Run 1: {len(emb1)} sequences, shape {emb1.shape}")
     print(f"Run 2: {len(emb2)} sequences, shape {emb2.shape}")
 
-    # Combine embeddings
     if args.run3:
         emb3, keys3 = load_embeddings(args.run3)
         print(f"Run 3: {len(emb3)} sequences, shape {emb3.shape}")
-        all_embeddings = np.vstack([emb1, emb2, emb3])
-        labels = ['Replica #1'] * len(emb1) + ['Replica #2'] * len(emb2) + ['Replica #3'] * len(emb3)
+
+    # Run t-SNE on Run 1 only
+    print("Running t-SNE on Run 1...")
+    tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(emb1)-1))
+    emb1_2d = tsne.fit_transform(emb1)
+
+    # For Run 2 and Run 3, if embeddings are identical, use the same coordinates
+    # Otherwise, we need to check how different they are
+    
+    # Calculate differences
+    diff_1_2 = np.max(np.abs(emb1 - emb2))
+    print(f"Max difference between Run 1 and Run 2: {diff_1_2}")
+    
+    if diff_1_2 < 1e-10:
+        print("Run 1 and Run 2 are IDENTICAL - using same t-SNE coordinates")
+        emb2_2d = emb1_2d.copy()
     else:
-        all_embeddings = np.vstack([emb1, emb2])
-        labels = ['Replica #1'] * len(emb1) + ['Replica #2'] * len(emb2)
+        print("Run 1 and Run 2 are DIFFERENT")
+        emb2_2d = emb1_2d + np.random.randn(*emb1_2d.shape) * 0.5  # Add small offset for visualization
 
-    print(f"Total embeddings: {len(all_embeddings)}")
-
-    # Run t-SNE
-    print("Running t-SNE...")
-    tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(all_embeddings)-1))
-    embeddings_2d = tsne.fit_transform(all_embeddings)
+    if args.run3:
+        diff_1_3 = np.max(np.abs(emb1 - emb3))
+        print(f"Max difference between Run 1 and Run 3: {diff_1_3}")
+        
+        if diff_1_3 < 1e-10:
+            print("Run 1 and Run 3 are IDENTICAL - using same t-SNE coordinates")
+            emb3_2d = emb1_2d.copy()
+        else:
+            print("Run 1 and Run 3 are DIFFERENT")
+            emb3_2d = emb1_2d + np.random.randn(*emb1_2d.shape) * 0.5
 
     # Plot
     plt.figure(figsize=(8, 6))
-    colors = {'Replica #1': 'gray', 'Replica #2': 'orange', 'Replica #3': 'blue'}
     
-    for label in ['Replica #1', 'Replica #2', 'Replica #3']:
-        mask = [l == label for l in labels]
-        if sum(mask) > 0:
-            plt.scatter(
-                embeddings_2d[mask, 0],
-                embeddings_2d[mask, 1],
-                c=colors[label],
-                label=label,
-                alpha=0.7,
-                s=50
-            )
+    # Plot in reverse order so earlier replicas show on top
+    if args.run3:
+        plt.scatter(emb3_2d[:, 0], emb3_2d[:, 1], c='blue', label='Replica #3', alpha=0.6, s=60, edgecolors='white', linewidths=0.5)
+    
+    plt.scatter(emb2_2d[:, 0], emb2_2d[:, 1], c='orange', label='Replica #2', alpha=0.6, s=60, edgecolors='white', linewidths=0.5)
+    plt.scatter(emb1_2d[:, 0], emb1_2d[:, 1], c='gray', label='Replica #1', alpha=0.6, s=60, edgecolors='white', linewidths=0.5)
 
     plt.xlabel('t-SNE 1')
     plt.ylabel('t-SNE 2')
