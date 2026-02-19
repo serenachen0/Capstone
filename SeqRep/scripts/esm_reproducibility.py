@@ -9,19 +9,19 @@ import h5py
 import numpy as np
 
 # ========== Config ==========
-FASTA_FILE = "examples/inputs/random_100.fasta"
-OUTPUT_DIR = "examples/outputs"
-PLOT_DIR = "plot"
+FASTA_FILE = "../examples/inputs/random_100.fasta"
+OUTPUT_DIR = "../examples/outputs"
+PLOT_DIR = "../plot"
 MODEL = "esm2_t33_650M_UR50D"
 LAYER = 33
-TSNE_SCRIPT = "scripts/plot_tsne.py"
+TSNE_SCRIPT = "../scripts/plot_tsne.py"
 # ==========================
 
 def run_esm_extract(run_id):
     out_dir = f"{OUTPUT_DIR}/esm_run{run_id}"
     print(f"\n=== Running ESM extract Run {run_id} ===")
     cmd = [
-        "python", "esm/scripts/extract.py",
+        "python", "../esm/scripts/extract.py",
         MODEL, FASTA_FILE, out_dir,
         "--repr_layers", str(LAYER),
         "--include", "mean"
