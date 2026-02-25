@@ -22,24 +22,24 @@ python -c "import tensorflow as tf; print('GPU available:', tf.test.is_gpu_avail
 
 # Run with 1900
 echo "=== Starting 1900 weights ==="
-python ../scripts/seq2rep.py ../examples/inputs/random_100.fasta ../1900_weights ../examples/outputs/runs/random_100_run5_1900.h5 
-python ../scripts/seq2rep.py ../examples/inputs/random_100.fasta ../1900_weights ../examples/outputs/runs/random_100_run6_1900.h5
+python ../scripts/seq2rep.py ../../data/inputs/random_100.fasta ../1900_weights ../../data/outputs/runs/random_100_run5_1900.h5 
+python ../scripts/seq2rep.py ../../data/inputs/random_100.fasta ../1900_weights ../../data/outputs/runs/random_100_run6_1900.h5
 
 # compare 1900
-python ../scripts/reps-compare.py ../examples/outputs/runs/random_100_run5_1900.h5 ../examples/outputs/runs/random_100_run6_1900.h5
+python ../scripts/reps-compare.py ../../data/outputs/runs/random_100_run5_1900.h5 ../../data/outputs/runs/random_100_run6_1900.h5
 
 # Run with 256
 echo "=== Starting 256 weights ==="
-python ../scripts/seq2rep.py ../examples/inputs/random_100.fasta ../256_weights ../examples/outputs/runs/random_100_run3_256.h5
-python ../scripts/seq2rep.py ../examples/inputs/random_100.fasta ../256_weights ../examples/outputs/runs/random_100_run4_256.h5
+python ../scripts/seq2rep.py ../../data/inputs/random_100.fasta ../256_weights ../../data/outputs/runs/random_100_run3_256.h5
+python ../scripts/seq2rep.py ../../data/inputs/random_100.fasta ../256_weights ../../data/outputs/runs/random_100_run4_256.h5
 
 # compare 256
-python ../scripts/scripts/reps-compare.py ../examples/outputs/random_100_run3_256.h5 ../examples/outputs/runs/random_100_run4_256.h5
+python ../scripts/scripts/reps-compare.py ../../data/outputs/random_100_run3_256.h5 ../../data/outputs/runs/random_100_run4_256.h5
 
 # Run with 64
 echo "=== Starting 64 weights ==="
-python ../scripts/seq2rep.py ../examples/inputs/random_100.fasta ../64_weights ../examples/outputs/runs/random_100_run3_64.h5
-python ../scripts/seq2rep.py ../examples/inputs/random_100.fasta ../64_weights ../examples/outputs/runs/random_100_run4_64.h5
+python ../scripts/seq2rep.py ../../data/inputs/random_100.fasta ../64_weights ../../data/outputs/runs/random_100_run3_64.h5
+python ../scripts/seq2rep.py ../../data/inputs/random_100.fasta ../64_weights ../../data/outputs/runs/random_100_run4_64.h5
 
 # compare 64
-python ../scripts/reps-compare.py ../examples/outputs/runs/random_100_run3_64.h5 ../examples/outputs/runs/random_100_run4_64.h5
+python ../scripts/reps-compare.py ../../data/outputs/runs/random_100_run3_64.h5 ../../data/outputs/runs/random_100_run4_64.h5

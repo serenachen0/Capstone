@@ -17,7 +17,7 @@ np.random.seed(42)
 #from unirep import babbler64 as babbler # 64-unit version
 # from unirep import babbler256 as babbler
 # from unirep import babbler1900 as babbler
-from unirep import babbler64, babbler256, babbler1900
+from SeqRep.unirep.scripts.unirep import babbler64, babbler256, babbler1900
 
 def create_parser():
     """
