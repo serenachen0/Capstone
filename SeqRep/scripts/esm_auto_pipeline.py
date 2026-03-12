@@ -10,8 +10,8 @@ import numpy as np
 
 # ========== Config ==========
 FASTA_FILE = "../data/inputs/random_100.fasta"
-OUTPUT_DIR = "../data/outputs/runs"
-PLOT_DIR = "../data/outputs/plot"
+OUTPUT_DIR = "../data/outputs/esm/runs"
+PLOT_DIR = "../data/outputs/esm/plot"
 MODEL = "esm2_t33_650M_UR50D"
 LAYER = 33
 TSNE_SCRIPT = "../scripts/plot_tsne.py"

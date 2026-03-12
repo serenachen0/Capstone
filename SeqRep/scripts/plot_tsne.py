@@ -1,143 +1,103 @@
 """
-plot_tsne.py - Plot t-SNE from ESM embedding runs
-Per-run StandardScaler -> PCA (95%) -> t-SNE -> overlay on same axes
+Generate t-SNE plot to visualize reproducibility of embeddings.
+Processes each run independently (PCA + t-SNE per run), then plots all on the same axes.
+Matches the researcher's notebook approach.
 """
+
 import os
-import sys
-import argparse
-import numpy as np
 import h5py
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib as mpl
 import matplotlib.pyplot as plt
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 from time import time
+import argparse
 
 
-# ========== Args ==========
-def parse_args():
-    parser = argparse.ArgumentParser(description="Plot t-SNE of embeddings from multiple runs")
-    parser.add_argument("--run1",   type=str, required=True,  help="First run h5 file")
-    parser.add_argument("--run2",   type=str, required=True,  help="Second run h5 file")
-    parser.add_argument("--run3",   type=str, default=None,   help="Third run h5 file (optional)")
-    parser.add_argument("--output", type=str, default="tsne_plot.png", help="Output image file")
-    parser.add_argument("--title",  type=str, default="t-SNE", help="Plot title")
-    return parser.parse_args()
-
-
-# ========== Load ==========
-def load_h5(h5_path):
-    """Load all embeddings from h5 file, sorted by key."""
+def load_embeddings(h5_path):
+    """Load embeddings from an h5 file in sorted key order."""
     with h5py.File(h5_path, 'r') as f:
         keys = sorted(f.keys())
-        embeddings = np.array([f[k][:] for k in keys])
-    return embeddings, keys
+        Xs = np.array([f[k][:] for k in keys])
+    return Xs
 
 
-# ========== PCA + t-SNE ==========
-def pca_then_tsne(Xs, label, perplexity=50, n_iter=10000, random_state=42):
-    """Standardize -> PCA (95% variance) -> t-SNE. Matches notebook logic."""
-
-    print(f"Input representation: {label}")
+def process_run(Xs, label, pca_variance, perplexity, n_iter, seed):
+    """Standardize -> PCA -> t-SNE for a single run's embeddings."""
+    print(f"\nInput representation: {label}")
     print(f"Original feature shape = {Xs.shape}")
 
-    # standardize
+    # Standardize
     Xs = StandardScaler().fit_transform(Xs)
 
     # PCA
-    pca = PCA(n_components=0.95)
+    pca = PCA(n_components=pca_variance, random_state=seed)
     Xs_pca = pca.fit_transform(Xs)
-    total_pcs = len(pca.explained_variance_ratio_)
-    total_var = pca.explained_variance_ratio_.sum()
-    print(f"Total number of selected principle components = {total_pcs}")
-    print(f"Total explained variance = {total_var}")
+    print(f"Total number of selected principle components = {len(pca.explained_variance_ratio_)}")
+    print(f"Total explained variance = {pca.explained_variance_ratio_.sum():.4f}")
     print(f"After PCA feature shape = {Xs_pca.shape}")
 
     # t-SNE
+    perp = min(perplexity, len(Xs_pca) - 1)
     t0 = time()
-    Xs_tsne = TSNE(
+    Xs_pca_tsne = TSNE(
         n_components=2,
         verbose=1,
-        perplexity=perplexity,
+        perplexity=perp,
         max_iter=n_iter,
-        random_state=random_state
+        random_state=seed,
     ).fit_transform(Xs_pca)
     t1 = time()
-    print(f"After PCA & t-SNE feature shape = {Xs_tsne.shape}, "
-          f"perplexity = {perplexity} finished in {t1 - t0:.2g} sec")
+    print(f"After PCA & t-SNE feature shape = {Xs_pca_tsne.shape}, perplexity = {perp}, finished in {t1 - t0:.2g} sec")
 
-    return Xs_tsne
+    return Xs_pca_tsne
 
 
-# ========== Plot ==========
-def plot(runs_tsne, labels, colors, title, output_path):
+def main():
+    parser = argparse.ArgumentParser(description="Plot t-SNE of embeddings from multiple runs")
+    parser.add_argument("--run1", type=str, required=True, help="First run h5 file")
+    parser.add_argument("--run2", type=str, required=True, help="Second run h5 file")
+    parser.add_argument("--run3", type=str, default=None, help="Third run h5 file (optional)")
+    parser.add_argument("--output", type=str, default="tsne_plot.png", help="Output image file")
+    parser.add_argument("--title", type=str, default="Embeddings", help="Plot title")
+    parser.add_argument("--perplexity", type=float, default=50.0, help="t-SNE perplexity")
+    parser.add_argument("--n_iter", type=int, default=10000, help="t-SNE max iterations")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--pca_variance", type=float, default=0.95, help="PCA explained variance threshold")
+    args = parser.parse_args()
+
+    runs = [("Run #1", args.run1, 'blue'),
+            ("Run #2", args.run2, 'green')]
+    if args.run3:
+        runs.append(("Run #3", args.run3, 'orange'))
+
+    # Plot setup — matches researcher's style
     mpl.rcParams['font.sans-serif'] = "Arial"
     plt.rcParams.update({'font.size': 22})
-
     fig, ax = plt.subplots(nrows=1, ncols=1)
-    fig.suptitle(title, y=0.95)
+    fig.suptitle(args.title, y=0.95)
 
-    for i, (Xs_tsne, label, color) in enumerate(zip(runs_tsne, labels, colors)):
-        s = 60 - 10 * i   # decreasing point size: 60, 50, 40 (matches notebook)
-        ax.scatter(
-            Xs_tsne[:, 0],
-            Xs_tsne[:, 1],
-            c=color,
-            label=label,
-            marker='o',
-            alpha=1,
-            s=s
-        )
+    for i, (label, h5_path, color) in enumerate(runs):
+        Xs = load_embeddings(h5_path)
+        Xs_2d = process_run(Xs, label, args.pca_variance, args.perplexity, args.n_iter, args.seed)
+
+        s = 60 - 10 * i  # decreasing marker size per run, matches notebook
+        ax.scatter(Xs_2d[:, 0], Xs_2d[:, 1], c=color, label=label,
+                   marker='o', alpha=1, s=s)
 
     ax.set_xlabel('t-SNE 1')
     ax.set_ylabel('t-SNE 2')
-    ax.legend(
-        bbox_to_anchor=(1.02, 1),
-        loc='upper left',
-        borderaxespad=0.,
-        markerscale=2,
-        handletextpad=0.2,
-        fontsize=18
-    )
+    ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left', borderaxespad=0.,
+              markerscale=2, handletextpad=0.2, fontsize=18)
 
-    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     plt.tight_layout()
-    plt.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.clf()
-    print(f"Saved plot to {output_path}")
-
-
-# ========== Main ==========
-def main():
-    args = parse_args()
-
-    h5_paths = [args.run1, args.run2]
-    labels   = ["Run #1", "Run #2"]
-    colors   = ["blue",   "green"]
-
-    if args.run3:
-        h5_paths.append(args.run3)
-        labels.append("Run #3")
-        colors.append("orange")
-
-    PERPLEXITY   = 50
-    N_ITER       = 10000
-    RANDOM_STATE = 42
-
-    runs_tsne = []
-    for h5_path, label in zip(h5_paths, labels):
-        emb, keys = load_h5(h5_path)
-        Xs_tsne = pca_then_tsne(
-            emb,
-            label=h5_path,
-            perplexity=PERPLEXITY,
-            n_iter=N_ITER,
-            random_state=RANDOM_STATE
-        )
-        runs_tsne.append(Xs_tsne)
-
-    plot(runs_tsne, labels, colors, args.title, args.output)
+    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    plt.savefig(args.output, dpi=150, bbox_inches='tight')
+    print(f"\nSaved plot to {args.output}")
 
 
 if __name__ == "__main__":
