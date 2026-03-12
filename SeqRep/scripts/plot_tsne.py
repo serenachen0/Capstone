@@ -1,91 +1,144 @@
 """
-Generate t-SNE plot - fit on Run 1 only, then transform all runs.
-This ensures identical embeddings will have identical t-SNE coordinates.
+plot_tsne.py - Plot t-SNE from ESM embedding runs
+Per-run StandardScaler -> PCA (95%) -> t-SNE -> overlay on same axes
 """
-
-import h5py
-import numpy as np
-import matplotlib.pyplot as plt
-from sklearn.manifold import TSNE
+import os
+import sys
 import argparse
+import numpy as np
+import h5py
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+from time import time
 
-def load_embeddings(h5_path):
-    """Load all embeddings from an h5 file."""
-    embeddings = []
-    keys = []
-    with h5py.File(h5_path, 'r') as f:
-        for key in sorted(f.keys()):  # Sort to ensure consistent order
-            embeddings.append(f[key][:])
-            keys.append(key)
-    return np.array(embeddings), keys
 
-def main():
+# ========== Args ==========
+def parse_args():
     parser = argparse.ArgumentParser(description="Plot t-SNE of embeddings from multiple runs")
-    parser.add_argument("--run1", type=str, required=True, help="First run h5 file")
-    parser.add_argument("--run2", type=str, required=True, help="Second run h5 file")
-    parser.add_argument("--run3", type=str, default=None, help="Third run h5 file (optional)")
+    parser.add_argument("--run1",   type=str, required=True,  help="First run h5 file")
+    parser.add_argument("--run2",   type=str, required=True,  help="Second run h5 file")
+    parser.add_argument("--run3",   type=str, default=None,   help="Third run h5 file (optional)")
     parser.add_argument("--output", type=str, default="tsne_plot.png", help="Output image file")
-    parser.add_argument("--title", type=str, default="mLSTM", help="Plot title")
-    args = parser.parse_args()
+    parser.add_argument("--title",  type=str, default="t-SNE", help="Plot title")
+    return parser.parse_args()
 
-    # Load embeddings from each run
-    emb1, keys1 = load_embeddings(args.run1)
-    emb2, keys2 = load_embeddings(args.run2)
-    
-    print(f"Run 1: {len(emb1)} sequences, shape {emb1.shape}")
-    print(f"Run 2: {len(emb2)} sequences, shape {emb2.shape}")
 
-    if args.run3:
-        emb3, keys3 = load_embeddings(args.run3)
-        print(f"Run 3: {len(emb3)} sequences, shape {emb3.shape}")
+# ========== Load ==========
+def load_h5(h5_path):
+    """Load all embeddings from h5 file, sorted by key."""
+    with h5py.File(h5_path, 'r') as f:
+        keys = sorted(f.keys())
+        embeddings = np.array([f[k][:] for k in keys])
+    return embeddings, keys
 
-    # Run t-SNE on Run 1 only
-    print("Running t-SNE on Run 1...")
-    tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(emb1)-1))
-    emb1_2d = tsne.fit_transform(emb1)
 
-    # For Run 2 and Run 3, if embeddings are identical, use the same coordinates
-    # Otherwise, we need to check how different they are
-    
-    # Calculate differences
-    diff_1_2 = np.max(np.abs(emb1 - emb2))
-    print(f"Max difference between Run 1 and Run 2: {diff_1_2}")
-    
-    if diff_1_2 < 1e-10:
-        print("Run 1 and Run 2 are IDENTICAL - using same t-SNE coordinates")
-        emb2_2d = emb1_2d.copy()
-    else:
-        print("Run 1 and Run 2 are DIFFERENT")
-        emb2_2d = emb1_2d + np.random.randn(*emb1_2d.shape) * 0.5  # Add small offset for visualization
+# ========== PCA + t-SNE ==========
+def pca_then_tsne(Xs, label, perplexity=50, n_iter=10000, random_state=42):
+    """Standardize -> PCA (95% variance) -> t-SNE. Matches notebook logic."""
 
-    if args.run3:
-        diff_1_3 = np.max(np.abs(emb1 - emb3))
-        print(f"Max difference between Run 1 and Run 3: {diff_1_3}")
-        
-        if diff_1_3 < 1e-10:
-            print("Run 1 and Run 3 are IDENTICAL - using same t-SNE coordinates")
-            emb3_2d = emb1_2d.copy()
-        else:
-            print("Run 1 and Run 3 are DIFFERENT")
-            emb3_2d = emb1_2d + np.random.randn(*emb1_2d.shape) * 0.5
+    print(f"Input representation: {label}")
+    print(f"Original feature shape = {Xs.shape}")
 
-    # Plot
-    plt.figure(figsize=(8, 6))
-    
-    # Plot in reverse order so earlier replicas show on top
-    if args.run3:
-        plt.scatter(emb3_2d[:, 0], emb3_2d[:, 1], c='blue', label='Replica #3', alpha=0.6, s=60, edgecolors='white', linewidths=0.5)
-    
-    plt.scatter(emb2_2d[:, 0], emb2_2d[:, 1], c='orange', label='Replica #2', alpha=0.6, s=60, edgecolors='white', linewidths=0.5)
-    plt.scatter(emb1_2d[:, 0], emb1_2d[:, 1], c='gray', label='Replica #1', alpha=0.6, s=60, edgecolors='white', linewidths=0.5)
+    # standardize
+    Xs = StandardScaler().fit_transform(Xs)
 
-    plt.xlabel('t-SNE 1')
-    plt.ylabel('t-SNE 2')
-    plt.title(args.title)
-    plt.legend(loc='upper right')
+    # PCA
+    pca = PCA(n_components=0.95)
+    Xs_pca = pca.fit_transform(Xs)
+    total_pcs = len(pca.explained_variance_ratio_)
+    total_var = pca.explained_variance_ratio_.sum()
+    print(f"Total number of selected principle components = {total_pcs}")
+    print(f"Total explained variance = {total_var}")
+    print(f"After PCA feature shape = {Xs_pca.shape}")
+
+    # t-SNE
+    t0 = time()
+    Xs_tsne = TSNE(
+        n_components=2,
+        verbose=1,
+        perplexity=perplexity,
+        max_iter=n_iter,
+        random_state=random_state
+    ).fit_transform(Xs_pca)
+    t1 = time()
+    print(f"After PCA & t-SNE feature shape = {Xs_tsne.shape}, "
+          f"perplexity = {perplexity} finished in {t1 - t0:.2g} sec")
+
+    return Xs_tsne
+
+
+# ========== Plot ==========
+def plot(runs_tsne, labels, colors, title, output_path):
+    mpl.rcParams['font.sans-serif'] = "Arial"
+    plt.rcParams.update({'font.size': 22})
+
+    fig, ax = plt.subplots(nrows=1, ncols=1)
+    fig.suptitle(title, y=0.95)
+
+    for i, (Xs_tsne, label, color) in enumerate(zip(runs_tsne, labels, colors)):
+        s = 60 - 10 * i   # decreasing point size: 60, 50, 40 (matches notebook)
+        ax.scatter(
+            Xs_tsne[:, 0],
+            Xs_tsne[:, 1],
+            c=color,
+            label=label,
+            marker='o',
+            alpha=1,
+            s=s
+        )
+
+    ax.set_xlabel('t-SNE 1')
+    ax.set_ylabel('t-SNE 2')
+    ax.legend(
+        bbox_to_anchor=(1.02, 1),
+        loc='upper left',
+        borderaxespad=0.,
+        markerscale=2,
+        handletextpad=0.2,
+        fontsize=18
+    )
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     plt.tight_layout()
-    plt.savefig(args.output, dpi=150)
-    print(f"Saved plot to {args.output}")
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.clf()
+    print(f"Saved plot to {output_path}")
+
+
+# ========== Main ==========
+def main():
+    args = parse_args()
+
+    h5_paths = [args.run1, args.run2]
+    labels   = ["Run #1", "Run #2"]
+    colors   = ["blue",   "green"]
+
+    if args.run3:
+        h5_paths.append(args.run3)
+        labels.append("Run #3")
+        colors.append("orange")
+
+    PERPLEXITY   = 50
+    N_ITER       = 10000
+    RANDOM_STATE = 42
+
+    runs_tsne = []
+    for h5_path, label in zip(h5_paths, labels):
+        emb, keys = load_h5(h5_path)
+        Xs_tsne = pca_then_tsne(
+            emb,
+            label=h5_path,
+            perplexity=PERPLEXITY,
+            n_iter=N_ITER,
+            random_state=RANDOM_STATE
+        )
+        runs_tsne.append(Xs_tsne)
+
+    plot(runs_tsne, labels, colors, args.title, args.output)
+
 
 if __name__ == "__main__":
     main()
