@@ -5,6 +5,14 @@ Matches the researcher's notebook approach.
 """
 
 import os
+
+# Reduce BLAS thread contention/crashes on macOS system Python + OpenBLAS
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import h5py
 import numpy as np
 import matplotlib
@@ -31,26 +39,65 @@ def process_run(Xs, label, pca_variance, perplexity, n_iter, seed):
     print(f"\nInput representation: {label}")
     print(f"Original feature shape = {Xs.shape}")
 
+    Xs = np.asarray(Xs)
+    if Xs.ndim == 1:
+        Xs = Xs.reshape(-1, 1)
+
+    n_samples, n_features = Xs.shape
+
+    # Edge case: too few samples/features for PCA+tSNE
+    if n_samples < 2 or n_features < 2:
+        print("Insufficient dimensions for PCA/t-SNE, using fallback 2D projection.")
+        out = np.zeros((n_samples, 2), dtype=float)
+        if n_samples > 1:
+            out[:, 0] = np.linspace(-1, 1, n_samples)
+        return out
+
     # Standardize
     Xs = StandardScaler().fit_transform(Xs)
 
-    # PCA
-    pca = PCA(n_components=pca_variance, random_state=seed)
-    Xs_pca = pca.fit_transform(Xs)
-    print(f"Total number of selected principle components = {len(pca.explained_variance_ratio_)}")
-    print(f"Total explained variance = {pca.explained_variance_ratio_.sum():.4f}")
+    # PCA (robust to low-rank inputs)
+    try:
+        pca = PCA(n_components=pca_variance, random_state=seed)
+        Xs_pca = pca.fit_transform(Xs)
+        print(f"Total number of selected principle components = {len(pca.explained_variance_ratio_)}")
+        print(f"Total explained variance = {pca.explained_variance_ratio_.sum():.4f}")
+    except ValueError as e:
+        print(f"PCA fallback due to: {e}")
+        k = min(n_samples, n_features)
+        pca = PCA(n_components=k, random_state=seed, svd_solver="full")
+        Xs_pca = pca.fit_transform(Xs)
+
     print(f"After PCA feature shape = {Xs_pca.shape}")
+
+    # Ensure at least 2 features before t-SNE and avoid TSNE init='pca' failure on 1D inputs
+    if Xs_pca.ndim == 1:
+        Xs_pca = Xs_pca.reshape(-1, 1)
+    if Xs_pca.shape[1] < 2:
+        Xs_pca = np.hstack([Xs_pca, np.zeros((Xs_pca.shape[0], 1), dtype=Xs_pca.dtype)])
 
     # t-SNE
     perp = min(perplexity, len(Xs_pca) - 1)
     t0 = time()
-    Xs_pca_tsne = TSNE(
-        n_components=2,
-        verbose=1,
-        perplexity=perp,
-        max_iter=n_iter,
-        random_state=seed,
-    ).fit_transform(Xs_pca)
+    try:
+        tsne = TSNE(
+            n_components=2,
+            verbose=1,
+            perplexity=perp,
+            max_iter=n_iter,
+            random_state=seed,
+            init="random",
+        )
+    except TypeError:
+        tsne = TSNE(
+            n_components=2,
+            verbose=1,
+            perplexity=perp,
+            n_iter=n_iter,
+            random_state=seed,
+            init="random",
+        )
+    Xs_pca_tsne = tsne.fit_transform(Xs_pca)
     t1 = time()
     print(f"After PCA & t-SNE feature shape = {Xs_pca_tsne.shape}, perplexity = {perp}, finished in {t1 - t0:.2g} sec")
 

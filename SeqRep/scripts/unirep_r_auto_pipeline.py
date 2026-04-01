@@ -8,9 +8,10 @@ Auto pipeline:
 
 import subprocess
 import os
+import argparse
 
 # ========= Config =========
-FASTA = "../data/inputs/random_100.fasta"
+DEFAULT_FASTA = "../data/inputs/random_100.fasta"
 WEIGHTS = "../unirep_restructured/64_weights"
 OUTPUT_DIR = "../data/outputs"
 PLOT_SCRIPT = "plot_tsne.py"
@@ -18,13 +19,14 @@ TITLE = "mLSTM (TF2.x)"
 # ==========================
 
 
-def run_seq2rep(run_id):
+def run_seq2rep(run_id, fasta_path):
     output_file = f"{OUTPUT_DIR}/mlstm/runs/local_test{run_id}.h5"
     print(f"\n=== Running UniRep Run {run_id} ===")
+    print(f"Using FASTA: {fasta_path}")
 
     cmd = [
         "python", "../unirep_restructured/seq2rep.py",
-        FASTA,
+        fasta_path,
         WEIGHTS,
         output_file
     ]
@@ -50,13 +52,25 @@ def run_plot(run1, run2, run3):
     subprocess.run(cmd, check=True)
 
 
+def resolve_fasta(cli_fasta=None):
+    return cli_fasta or os.getenv("FASTA_FILE") or os.getenv("FASTA") or DEFAULT_FASTA
+
+
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--fasta", type=str, default=None)
+    args = parser.parse_args()
+
+    fasta_path = resolve_fasta(args.fasta)
+    if not os.path.exists(fasta_path):
+        raise FileNotFoundError(f"FASTA file not found: {fasta_path}")
+
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     # Step 1: Run seq2rep 3 times
     h5_files = []
     for i in range(1, 4):
-        h5_files.append(run_seq2rep(i))
+        h5_files.append(run_seq2rep(i, fasta_path))
 
     # Step 2: Plot
     run_plot(h5_files[0], h5_files[1], h5_files[2])

@@ -3,13 +3,15 @@ Auto pipeline: run ESM extract 3 times -> convert to h5 -> compare -> plot t-SNE
 """
 
 import os
+import sys
 import subprocess
+import argparse
 import torch
 import h5py
 import numpy as np
 
 # ========== Config ==========
-FASTA_FILE = "../data/inputs/random_100.fasta"
+DEFAULT_FASTA = "../data/inputs/random_100.fasta"
 OUTPUT_DIR = "../data/outputs/esm/runs"
 PLOT_DIR = "../data/outputs/esm/plot"
 MODEL = "esm2_t33_650M_UR50D"
@@ -17,12 +19,13 @@ LAYER = 33
 TSNE_SCRIPT = "../scripts/plot_tsne.py"
 # ==========================
 
-def run_esm_extract(run_id):
+def run_esm_extract(run_id, fasta_path):
     out_dir = f"{OUTPUT_DIR}/esm_run{run_id}"
     print(f"\n=== Running ESM extract Run {run_id} ===")
+    print(f"Using FASTA: {fasta_path}")
     cmd = [
-        "python", "../esm/scripts/extract.py",
-        MODEL, FASTA_FILE, out_dir,
+        sys.executable, "../esm/scripts/extract.py",
+        MODEL, fasta_path, out_dir,
         "--repr_layers", str(LAYER),
         "--include", "mean"
     ]
@@ -54,21 +57,48 @@ def compare_h5(h5_path1, h5_path2, label):
 def plot_tsne(h5_run1, h5_run2, h5_run3, output, title):
     print(f"\n=== Plotting t-SNE: {title} ===")
     cmd = [
-        "python", TSNE_SCRIPT,
+        sys.executable, TSNE_SCRIPT,
         "--run1", h5_run1,
         "--run2", h5_run2,
         "--run3", h5_run3,
         "--output", output,
         "--title", title
     ]
-    subprocess.run(cmd, check=True)
+
+    env = os.environ.copy()
+    env.setdefault("OPENBLAS_NUM_THREADS", "1")
+    env.setdefault("OMP_NUM_THREADS", "1")
+    env.setdefault("MKL_NUM_THREADS", "1")
+    env.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+    env.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+    proc = subprocess.run(cmd, env=env, text=True, capture_output=True)
+    if proc.stdout:
+        print(proc.stdout)
+    if proc.stderr:
+        print(proc.stderr)
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd, output=proc.stdout, stderr=proc.stderr)
+
+def resolve_fasta(cli_fasta=None):
+    return cli_fasta or os.getenv("FASTA_FILE") or os.getenv("FASTA") or DEFAULT_FASTA
+
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--fasta", type=str, default=None)
+    args = parser.parse_args()
+
+    fasta_path = resolve_fasta(args.fasta)
+    if not os.path.exists(fasta_path):
+        raise FileNotFoundError(f"FASTA file not found: {fasta_path}")
+
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(PLOT_DIR, exist_ok=True)
 
     # Step 1: Run ESM 3 times
     for i in range(1, 4):
-        run_esm_extract(i)
+        run_esm_extract(i, fasta_path)
 
     # Step 2: Convert pt -> h5
     h5_files = []

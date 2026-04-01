@@ -373,15 +373,16 @@ function parseFasta(text) {
 }
 
 // ─── Upload Section ─────────────────────────────────────────────────────────
-function UploadSection() {
+function UploadSection({ model, setModel, onRunComplete }) {
   const t = useTheme();
   const [files, setFiles] = useState([]);
   const [previews, setPreviews] = useState({});
-  const [model, setModel] = useState("both");
   const [status, setStatus] = useState("idle");
   const [progress, setProgress] = useState(0);
   const [results, setResults] = useState(null);
   const [errorMsg, setErrorMsg] = useState("");
+  const [runMessage, setRunMessage] = useState("");
+  const [runLogs, setRunLogs] = useState([]);
   const inputRef = useRef(null);
   const [drag, setDrag] = useState(false);
   const busy = status === "running_unirep" || status === "running_esm2";
@@ -448,6 +449,7 @@ function UploadSection() {
       setStatus("uploaded");
       setResults(null);
       setProgress(0);
+      onRunComplete?.(null);
     }
   };
   const rm = (i) => {
@@ -464,50 +466,104 @@ function UploadSection() {
     }
   };
 
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
   const run = async () => {
     if (!files.length) return;
     try {
-      setProgress(5);
-      if (doU) {
-        setStatus("running_unirep");
-        setProgress(10);
-        for (let i = 0; i < files.length; i++) {
-          await new Promise((r) => setTimeout(r, 250 + Math.random() * 200));
-          setProgress(
-            10 + Math.round(((i + 1) / files.length) * (doE ? 40 : 85))
-          );
+      setErrorMsg("");
+      setRunMessage("Job queued...");
+      setRunLogs(["[INIT] Job queued..."]);
+      setStatus(doU ? "running_unirep" : "running_esm2");
+      setProgress(1);
+
+      const payloadFiles = await Promise.all(
+        files.map(async (f) => ({ name: f.name, content: await f.text() }))
+      );
+
+      const startResp = await fetch("http://localhost:8000/api/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ files: payloadFiles, model }),
+      });
+
+      if (!startResp.ok) {
+        throw new Error(`Backend error: ${startResp.status}`);
+      }
+
+      const { jobId } = await startResp.json();
+      if (!jobId) throw new Error("Missing job id");
+
+      let finalResult = null;
+      while (!finalResult) {
+        await sleep(300);
+        const pollResp = await fetch(`http://localhost:8000/api/run/${jobId}`);
+        if (!pollResp.ok) {
+          throw new Error(`Poll failed: ${pollResp.status}`);
+        }
+
+        const poll = await pollResp.json();
+        setProgress(Math.max(1, Math.min(100, poll.progress ?? 1)));
+        if (poll.message) {
+          setRunMessage(poll.message);
+        }
+        if (Array.isArray(poll.logs)) {
+          setRunLogs(poll.logs.slice(-300));
+        }
+        if (poll.phase === "running_unirep" || poll.phase === "running_esm2") {
+          setStatus(poll.phase);
+        }
+
+        if (poll.status === "complete") {
+          finalResult = poll.result;
+          break;
+        }
+
+        if (poll.status === "error") {
+          throw new Error(poll.error || poll.message || "Run failed");
         }
       }
-      if (doE) {
-        setStatus("running_esm2");
-        if (!doU) setProgress(10);
-        for (let i = 0; i < files.length; i++) {
-          await new Promise((r) => setTimeout(r, 80 + Math.random() * 100));
-          setProgress(
-            (doU ? 50 : 10) +
-              Math.round(((i + 1) / files.length) * (doU ? 45 : 85))
-          );
-        }
-      }
+
+      const mapped = (finalResult.files || []).map((f) => ({
+        name: f.fileName,
+        u: f.outputs?.unirep?.name || null,
+        uUrl: f.outputs?.unirep?.downloadUrl
+          ? `http://localhost:8000${f.outputs.unirep.downloadUrl}`
+          : null,
+        e: f.outputs?.esm2?.name || null,
+        eUrl: f.outputs?.esm2?.downloadUrl
+          ? `http://localhost:8000${f.outputs.esm2.downloadUrl}`
+          : null,
+      }));
+
       setProgress(100);
       setStatus("complete");
-      setResults(
-        files.map((f) => {
-          const b = f.name.replace(/\.\w+$/, "");
-          return {
-            name: f.name,
-            u: doU ? `${b}_unirep_1900.h5` : null,
-            e: doE ? `${b}_esm2_1280.h5` : null,
-          };
-        })
-      );
+      setRunMessage("Completed");
+      setRunLogs((prev) => [...prev, "[complete] Completed"]);
+      setResults(mapped);
+      onRunComplete?.({
+        model: finalResult.model || model,
+        files: mapped,
+        reproducibility: finalResult.reproducibility || null,
+      });
     } catch (e) {
-      setErrorMsg(e.message);
+      const msg = e.message || "Run failed";
+      setErrorMsg(msg);
+      setRunMessage(msg);
+      setRunLogs((prev) => [...prev, `[error] ${msg}`]);
       setStatus("error");
     }
   };
-  const dl = (n) =>
-    alert(`Download ${n}\n(Mock — connect backend for real downloads)`);
+
+  const dl = (name, url) => {
+    if (!url) return;
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  };
   const reset = () => {
     setFiles([]);
     setPreviews({});
@@ -515,6 +571,9 @@ function UploadSection() {
     setProgress(0);
     setResults(null);
     setErrorMsg("");
+    setRunMessage("");
+    setRunLogs([]);
+    onRunComplete?.(null);
   };
 
   const steps = [
@@ -902,6 +961,42 @@ function UploadSection() {
                 >
                   {progress}%
                 </div>
+                {runMessage && (
+                  <div
+                    style={{
+                      marginTop: 8,
+                      fontSize: 12,
+                      color: t.textSecondary,
+                      fontFamily: "'JetBrains Mono'",
+                      wordBreak: "break-word",
+                    }}
+                  >
+                    {runMessage}
+                  </div>
+                )}
+
+                {runLogs.length > 0 && (
+                  <div
+                    style={{
+                      marginTop: 10,
+                      padding: "8px 10px",
+                      border: `1px solid ${t.border}`,
+                      borderRadius: 8,
+                      background: t.surface,
+                      maxHeight: 130,
+                      overflowY: "auto",
+                      fontFamily: "'JetBrains Mono'",
+                      fontSize: 11,
+                      color: t.textSecondary,
+                      lineHeight: 1.5,
+                      whiteSpace: "pre-wrap",
+                    }}
+                  >
+                    {runLogs.map((line, idx) => (
+                      <div key={idx}>{line}</div>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
             {status !== "idle" && (
@@ -947,133 +1042,7 @@ function UploadSection() {
               </div>
             )}
           </div>
-          {results?.length > 0 && (
-            <div
-              style={{
-                display: "flex",
-                flexDirection: "column",
-                gap: 8,
-                maxHeight: 220,
-                overflowY: "auto",
-                paddingRight: 4,
-              }}
-            >
-              <div
-                style={{
-                  fontSize: 12,
-                  color: t.textMuted,
-                  letterSpacing: "0.06em",
-                  textTransform: "uppercase",
-                }}
-              >
-                Download (
-                {results.reduce((n, r) => n + (r.u ? 1 : 0) + (r.e ? 1 : 0), 0)}{" "}
-                files)
-              </div>
-              {results.map((r, i) => (
-                <div key={i}>
-                  <div
-                    style={{
-                      fontSize: 12,
-                      color: t.textMuted,
-                      marginBottom: 3,
-                    }}
-                  >
-                    📄 {r.name}
-                  </div>
-                  {r.u && (
-                    <div
-                      onClick={() => dl(r.u)}
-                      style={{
-                        background: t.surface,
-                        border: `1px solid ${t.amberBorder}`,
-                        borderRadius: 8,
-                        padding: "8px 12px",
-                        display: "flex",
-                        justifyContent: "space-between",
-                        alignItems: "center",
-                        cursor: "pointer",
-                        marginBottom: r.e ? 3 : 0,
-                        transition: "border-color 0.15s",
-                      }}
-                      onMouseEnter={(e) =>
-                        (e.currentTarget.style.borderColor = t.amber)
-                      }
-                      onMouseLeave={(e) =>
-                        (e.currentTarget.style.borderColor = t.amberBorder)
-                      }
-                    >
-                      <div>
-                        <div
-                          style={{
-                            fontSize: 13,
-                            fontWeight: 600,
-                            color: t.text,
-                          }}
-                        >
-                          {r.u}
-                        </div>
-                        <div style={{ fontSize: 11, color: t.textMuted }}>
-                          UniRep · 1900d
-                        </div>
-                      </div>
-                      <span
-                        style={{
-                          fontSize: 13,
-                          color: t.amber,
-                          fontWeight: 600,
-                        }}
-                      >
-                        ↓
-                      </span>
-                    </div>
-                  )}
-                  {r.e && (
-                    <div
-                      onClick={() => dl(r.e)}
-                      style={{
-                        background: t.surface,
-                        border: `1px solid ${t.blueBorder}`,
-                        borderRadius: 8,
-                        padding: "8px 12px",
-                        display: "flex",
-                        justifyContent: "space-between",
-                        alignItems: "center",
-                        cursor: "pointer",
-                        transition: "border-color 0.15s",
-                      }}
-                      onMouseEnter={(e) =>
-                        (e.currentTarget.style.borderColor = t.blue)
-                      }
-                      onMouseLeave={(e) =>
-                        (e.currentTarget.style.borderColor = t.blueBorder)
-                      }
-                    >
-                      <div>
-                        <div
-                          style={{
-                            fontSize: 13,
-                            fontWeight: 600,
-                            color: t.text,
-                          }}
-                        >
-                          {r.e}
-                        </div>
-                        <div style={{ fontSize: 11, color: t.textMuted }}>
-                          ESM-2 · 1280d
-                        </div>
-                      </div>
-                      <span
-                        style={{ fontSize: 13, color: t.blue, fontWeight: 600 }}
-                      >
-                        ↓
-                      </span>
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
+
         </div>
       </div>
       <style>{`@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}`}</style>
@@ -1085,16 +1054,20 @@ function UploadSection() {
 export default function App() {
   const [isDark, setIsDark] = useState(false);
   const [speedMode, setSpeedMode] = useState("single");
+  const [selectedModel, setSelectedModel] = useState("both");
+  const [runSummary, setRunSummary] = useState(null);
   const t = isDark ? themes.dark : themes.light;
+  const reproPts = runSummary?.reproducibility?.unirep || REPRO;
+  const esmPts = runSummary?.reproducibility?.esm2 || ESM;
   const reproT = [
-    mkTrace(REPRO, "Run 1", CLR.r1),
-    mkTrace(REPRO, "Run 2", CLR.r2, 6),
-    mkTrace(REPRO, "Run 3", CLR.r3, 4),
+    mkTrace(reproPts, "Run 1", CLR.r1),
+    mkTrace(reproPts, "Run 2", CLR.r2, 6),
+    mkTrace(reproPts, "Run 3", CLR.r3, 4),
   ];
   const esmT = [
-    mkTrace(ESM, "Run 1", CLR.r1),
-    mkTrace(ESM, "Run 2", CLR.r2, 6),
-    mkTrace(ESM, "Run 3", CLR.r3, 4),
+    mkTrace(esmPts, "Run 1", CLR.r1),
+    mkTrace(esmPts, "Run 2", CLR.r2, 6),
+    mkTrace(esmPts, "Run 3", CLR.r3, 4),
   ];
   const pL = {
     paper_bgcolor: "rgba(0,0,0,0)",
@@ -1229,7 +1202,11 @@ export default function App() {
           </div>
         </header>
 
-        <UploadSection />
+        <UploadSection
+          model={selectedModel}
+          setModel={setSelectedModel}
+          onRunComplete={setRunSummary}
+        />
 
         {/* Reproducibility */}
         <section id="repro" style={S}>
@@ -1238,78 +1215,211 @@ export default function App() {
             title="Reproducibility"
             subtitle="PCA → t-SNE confirms bitwise-identical embeddings across runs"
           />
-          <div
-            style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}
-          >
+
+          {runSummary && (
             <div
               style={{
-                background: t.surface,
-                border: `1px solid ${t.amberBorder}`,
-                borderRadius: 14,
-                padding: 18,
-                boxShadow: t.cardShadow,
+                display: "grid",
+                gridTemplateColumns:
+                  runSummary.model === "both" ? "1fr 1fr" : "1fr",
+                gap: 20,
               }}
             >
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  marginBottom: 6,
-                }}
-              >
-                <span style={{ fontSize: 16, fontWeight: 600, color: t.amber }}>
-                  UniRep (mLSTM)
-                </span>
-                <Badge label="Deterministic" good />
-              </div>
-              <div
-                style={{ fontSize: 13, color: t.textMuted, marginBottom: 4 }}
-              >
-                TensorFlow 2.18
-              </div>
-              <Plot
-                id="r-tsne"
-                data={reproT}
-                layout={{ ...pL, title: pT("t-SNE — All runs overlap") }}
-                style={{ width: "100%", height: 370 }}
-              />
+              {(runSummary.model === "both" || runSummary.model === "unirep") && (
+                <div
+                  style={{
+                    background: t.surface,
+                    border: `1px solid ${t.amberBorder}`,
+                    borderRadius: 14,
+                    padding: 18,
+                    boxShadow: t.cardShadow,
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      marginBottom: 6,
+                    }}
+                  >
+                    <span
+                      style={{ fontSize: 16, fontWeight: 600, color: t.amber }}
+                    >
+                      UniRep (mLSTM)
+                    </span>
+                    <Badge label="Deterministic" good />
+                  </div>
+                  <div
+                    style={{ fontSize: 13, color: t.textMuted, marginBottom: 4 }}
+                  >
+                    TensorFlow 2.18
+                  </div>
+                  <div
+                    style={{
+                      width: "100%",
+                      height: 370,
+                      borderRadius: 8,
+                      overflow: "hidden",
+                      border: `1px solid ${t.border}`,
+                      background: t.bg,
+                    }}
+                  >
+                    <img
+                      src={`http://localhost:8000/api/plot/unirep/latest?ts=${Date.now()}`}
+                      alt="UniRep t-SNE latest"
+                      style={{
+                        width: "100%",
+                        height: "100%",
+                        objectFit: "contain",
+                        display: "block",
+                      }}
+                    />
+                  </div>
+                  <div
+                    onClick={() =>
+                      window.open("http://localhost:8000/api/download/unirep/first", "_blank")
+                    }
+                    style={{
+                      background: t.surface,
+                      border: `1px solid ${t.amberBorder}`,
+                      borderRadius: 8,
+                      padding: "8px 12px",
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      cursor: "pointer",
+                      transition: "border-color 0.15s",
+                      marginTop: 10,
+                    }}
+                    onMouseEnter={(e) =>
+                      (e.currentTarget.style.borderColor = t.amber)
+                    }
+                    onMouseLeave={(e) =>
+                      (e.currentTarget.style.borderColor = t.amberBorder)
+                    }
+                  >
+                    <div>
+                      <div
+                        style={{
+                          fontSize: 13,
+                          fontWeight: 600,
+                          color: t.text,
+                        }}
+                      >
+                        first_unirep_run.h5
+                      </div>
+                      <div style={{ fontSize: 11, color: t.textMuted }}>
+                        UniRep · 1900d
+                      </div>
+                    </div>
+                    <span
+                      style={{ fontSize: 13, color: t.amber, fontWeight: 600 }}
+                    >
+                      ↓
+                    </span>
+                  </div>
+                </div>
+              )}
+              {(runSummary.model === "both" || runSummary.model === "esm2") && (
+                <div
+                  style={{
+                    background: t.surface,
+                    border: `1px solid ${t.blueBorder}`,
+                    borderRadius: 14,
+                    padding: 18,
+                    boxShadow: t.cardShadow,
+                  }}
+                >
+                  <div
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      marginBottom: 6,
+                    }}
+                  >
+                    <span style={{ fontSize: 16, fontWeight: 600, color: t.blue }}>
+                      ESM-2 (Transformer)
+                    </span>
+                    <Badge label="Deterministic" good />
+                  </div>
+                  <div
+                    style={{ fontSize: 13, color: t.textMuted, marginBottom: 4 }}
+                  >
+                    PyTorch — natively deterministic
+                  </div>
+                  <div
+                    style={{
+                      width: "100%",
+                      height: 370,
+                      borderRadius: 8,
+                      overflow: "hidden",
+                      border: `1px solid ${t.border}`,
+                      background: t.bg,
+                    }}
+                  >
+                    <img
+                      src={`http://localhost:8000/api/plot/esm/latest?ts=${Date.now()}`}
+                      alt="ESM t-SNE latest"
+                      style={{
+                        width: "100%",
+                        height: "100%",
+                        objectFit: "contain",
+                        display: "block",
+                      }}
+                    />
+                  </div>
+                  <div
+                    onClick={() =>
+                      window.open(
+                        "http://localhost:8000/api/download/esm2/esm_run1.h5",
+                        "_blank"
+                      )
+                    }
+                    style={{
+                      background: t.surface,
+                      border: `1px solid ${t.blueBorder}`,
+                      borderRadius: 8,
+                      padding: "8px 12px",
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      cursor: "pointer",
+                      transition: "border-color 0.15s",
+                      marginTop: 10,
+                    }}
+                    onMouseEnter={(e) =>
+                      (e.currentTarget.style.borderColor = t.blue)
+                    }
+                    onMouseLeave={(e) =>
+                      (e.currentTarget.style.borderColor = t.blueBorder)
+                    }
+                  >
+                    <div>
+                      <div
+                        style={{
+                          fontSize: 13,
+                          fontWeight: 600,
+                          color: t.text,
+                        }}
+                      >
+                        esm_run1.h5
+                      </div>
+                      <div style={{ fontSize: 11, color: t.textMuted }}>
+                        ESM-2 · 1280d
+                      </div>
+                    </div>
+                    <span
+                      style={{ fontSize: 13, color: t.blue, fontWeight: 600 }}
+                    >
+                      ↓
+                    </span>
+                  </div>
+                </div>
+              )}
             </div>
-            <div
-              style={{
-                background: t.surface,
-                border: `1px solid ${t.blueBorder}`,
-                borderRadius: 14,
-                padding: 18,
-                boxShadow: t.cardShadow,
-              }}
-            >
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  marginBottom: 6,
-                }}
-              >
-                <span style={{ fontSize: 16, fontWeight: 600, color: t.blue }}>
-                  ESM-2 (Transformer)
-                </span>
-                <Badge label="Deterministic" good />
-              </div>
-              <div
-                style={{ fontSize: 13, color: t.textMuted, marginBottom: 4 }}
-              >
-                PyTorch — natively deterministic
-              </div>
-              <Plot
-                id="e-tsne"
-                data={esmT}
-                layout={{ ...pL, title: pT("t-SNE — All runs identical") }}
-                style={{ width: "100%", height: 370 }}
-              />
-            </div>
-          </div>
+          )}
           <p
             style={{
               fontSize: 13,
