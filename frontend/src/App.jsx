@@ -64,6 +64,46 @@ const themes = {
   },
 };
 
+const colorBlindPalette = {
+  accent: "#0072B2",
+  green: "#009E73",
+  red: "#D55E00",
+  amber: "#E69F00",
+  blue: "#56B4E9",
+};
+
+const alpha = (hex, a) => {
+  const h = hex.replace("#", "");
+  const r = parseInt(h.slice(0, 2), 16);
+  const g = parseInt(h.slice(2, 4), 16);
+  const b = parseInt(h.slice(4, 6), 16);
+  return `rgba(${r},${g},${b},${a})`;
+};
+
+const applyColorBlind = (theme) => {
+  const base = { ...theme };
+  const { accent, green, red, amber, blue } = colorBlindPalette;
+  return {
+    ...base,
+    accent,
+    accentBg: alpha(accent, 0.12),
+    accentBorder: alpha(accent, 0.28),
+    green,
+    greenBg: alpha(green, 0.12),
+    greenBorder: alpha(green, 0.28),
+    red,
+    redBg: alpha(red, 0.12),
+    redBorder: alpha(red, 0.28),
+    amber,
+    amberBg: alpha(amber, 0.12),
+    amberBorder: alpha(amber, 0.28),
+    blue,
+    blueBg: alpha(blue, 0.12),
+    blueBorder: alpha(blue, 0.28),
+    plotFont: base.plotFont,
+  };
+};
+
 // ─── Mock Data ──────────────────────────────────────────────────────────────
 function seededRandom(seed) {
   let s = seed;
@@ -86,7 +126,11 @@ const SPEED = {
   single: { unirep: 1.2, esm2: 0.05 },
   multi100: { unirep: 45.3, esm2: 1.8 },
 };
-const CLR = { r1: "#94a3b8", r2: "#f59e0b", r3: "#3b82f6" };
+const getRunColors = (theme) => ({
+  r1: theme.textMuted,
+  r2: theme.amber,
+  r3: theme.blue,
+});
 
 // ─── Plotly ─────────────────────────────────────────────────────────────────
 function Plot({ id, data, layout, style }) {
@@ -122,7 +166,7 @@ function mkTrace(pts, name, color, sz = 8) {
 }
 
 // ─── Navbar ─────────────────────────────────────────────────────────────────
-function Navbar({ isDark, setIsDark }) {
+function Navbar({ isDark, setIsDark, colorBlind, setColorBlind }) {
   const t = useTheme();
   const secs = [
     { id: "hero", l: "Overview" },
@@ -185,21 +229,39 @@ function Navbar({ isDark, setIsDark }) {
           </button>
         ))}
       </div>
-      <button
-        onClick={() => setIsDark(!isDark)}
-        style={{
-          padding: "7px 12px",
-          fontSize: 18,
-          background: t.surface,
-          border: `1px solid ${t.border}`,
-          borderRadius: 8,
-          cursor: "pointer",
-          color: t.text,
-          flexShrink: 0,
-        }}
-      >
-        {isDark ? "☀️" : "🌙"}
-      </button>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+        <button
+          onClick={() => setColorBlind(!colorBlind)}
+          title={colorBlind ? "Disable color-blind mode" : "Enable color-blind mode"}
+          style={{
+            padding: "7px 12px",
+            fontSize: 13,
+            fontWeight: 600,
+            background: colorBlind ? t.accentBg : t.surface,
+            border: `1px solid ${colorBlind ? t.accentBorder : t.border}`,
+            borderRadius: 8,
+            cursor: "pointer",
+            color: colorBlind ? t.accent : t.textSecondary,
+            fontFamily: "'JetBrains Mono'",
+          }}
+        >
+          CB
+        </button>
+        <button
+          onClick={() => setIsDark(!isDark)}
+          style={{
+            padding: "7px 12px",
+            fontSize: 18,
+            background: t.surface,
+            border: `1px solid ${t.border}`,
+            borderRadius: 8,
+            cursor: "pointer",
+            color: t.text,
+          }}
+        >
+          {isDark ? "☀️" : "🌙"}
+        </button>
+      </div>
     </nav>
   );
 }
@@ -468,12 +530,25 @@ function UploadSection({ model, setModel, onRunComplete }) {
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+  const shouldHideLogLine = (line = "") => {
+    const l = String(line).toLowerCase();
+    return (
+      l.includes("warning") ||
+      l.includes("warnings.warn(") ||
+      l.includes("notopensslwarning") ||
+      l.includes("userwarning")
+    );
+  };
+
+  const filterLogsForUi = (logs = []) =>
+    logs.filter((line) => !shouldHideLogLine(line));
+
   const run = async () => {
     if (!files.length) return;
     try {
       setErrorMsg("");
       setRunMessage("Job queued...");
-      setRunLogs(["[INIT] Job queued..."]);
+      setRunLogs(filterLogsForUi(["[INIT] Job queued..."]));
       setStatus(doU ? "running_unirep" : "running_esm2");
       setProgress(1);
 
@@ -508,7 +583,7 @@ function UploadSection({ model, setModel, onRunComplete }) {
           setRunMessage(poll.message);
         }
         if (Array.isArray(poll.logs)) {
-          setRunLogs(poll.logs.slice(-300));
+          setRunLogs(filterLogsForUi(poll.logs.slice(-300)));
         }
         if (poll.phase === "running_unirep" || poll.phase === "running_esm2") {
           setStatus(poll.phase);
@@ -545,6 +620,7 @@ function UploadSection({ model, setModel, onRunComplete }) {
         model: finalResult.model || model,
         files: mapped,
         reproducibility: finalResult.reproducibility || null,
+        metrics: finalResult.metrics || null,
       });
     } catch (e) {
       const msg = e.message || "Run failed";
@@ -1053,12 +1129,14 @@ function UploadSection({ model, setModel, onRunComplete }) {
 // ─── Main ───────────────────────────────────────────────────────────────────
 export default function App() {
   const [isDark, setIsDark] = useState(false);
-  const [speedMode, setSpeedMode] = useState("single");
+  const [colorBlind, setColorBlind] = useState(false);
   const [selectedModel, setSelectedModel] = useState("both");
   const [runSummary, setRunSummary] = useState(null);
-  const t = isDark ? themes.dark : themes.light;
+  const baseTheme = isDark ? themes.dark : themes.light;
+  const t = colorBlind ? applyColorBlind(baseTheme) : baseTheme;
   const reproPts = runSummary?.reproducibility?.unirep || REPRO;
   const esmPts = runSummary?.reproducibility?.esm2 || ESM;
+  const CLR = getRunColors(t);
   const reproT = [
     mkTrace(reproPts, "Run 1", CLR.r1),
     mkTrace(reproPts, "Run 2", CLR.r2, 6),
@@ -1097,20 +1175,58 @@ export default function App() {
     text,
     font: { size: 13, color: t.textMuted, family: "JetBrains Mono" },
   });
-  const sm = speedMode === "single" ? "single" : "multi100";
+
+  const sequenceCount = runSummary?.metrics?.sequenceCount || 0;
+  const hasSpeedMetrics = Boolean(
+    runSummary?.metrics &&
+      (typeof runSummary.metrics.unirepSec === "number" ||
+        typeof runSummary.metrics.esm2Sec === "number")
+  );
+  const safeSeqCount = Math.max(1, sequenceCount);
+
+  const avgUnirep =
+    typeof runSummary?.metrics?.unirepSec === "number"
+      ? runSummary.metrics.unirepSec / safeSeqCount
+      : null;
+  const avgEsm2 =
+    typeof runSummary?.metrics?.esm2Sec === "number"
+      ? runSummary.metrics.esm2Sec / safeSeqCount
+      : null;
+
+  const speedLabels = [];
+  const speedValues = [];
+  const speedColors = [];
+  if (avgUnirep !== null) {
+    speedLabels.push("UniRep");
+    speedValues.push(avgUnirep);
+    speedColors.push(t.amber);
+  }
+  if (avgEsm2 !== null) {
+    speedLabels.push("ESM-2");
+    speedValues.push(avgEsm2);
+    speedColors.push(t.blue);
+  }
+
+  const speedRatio =
+    avgUnirep !== null && avgEsm2 !== null && avgEsm2 > 0
+      ? Number((avgUnirep / avgEsm2).toFixed(2))
+      : null;
+  const speedRatioLabel = speedRatio ? speedRatio.toFixed(2) : "—";
+  const proteinLabel = `${sequenceCount} ${sequenceCount === 1 ? "Protein" : "Proteins"}`;
+
   const sT = [
     {
-      x: ["UniRep", "ESM-2"],
-      y: [SPEED[sm].unirep, SPEED[sm].esm2],
+      x: speedLabels,
+      y: speedValues,
       type: "bar",
-      marker: { color: ["#f59e0b", "#3b82f6"], opacity: 0.85 },
-      hovertemplate: "<b>%{x}</b><br>%{y:.2f}s<extra></extra>",
+      marker: { color: speedColors, opacity: 0.85 },
+      hovertemplate: "<b>%{x}</b><br>%{y:.3f}s / protein<extra></extra>",
     },
   ];
   const sL = {
     ...pL,
     title: {
-      text: speedMode === "single" ? "Single Protein" : "100 Proteins",
+      text: `${proteinLabel} · avg per protein`,
       font: { size: 13, color: t.textSecondary, family: "JetBrains Mono" },
     },
     yaxis: {
@@ -1121,7 +1237,6 @@ export default function App() {
     showlegend: false,
     bargap: 0.5,
   };
-  const ratio = (SPEED[sm].unirep / SPEED[sm].esm2).toFixed(0);
   const S = {
     position: "relative",
     zIndex: 1,
@@ -1146,7 +1261,12 @@ export default function App() {
           href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@300;400;500;700&family=Space+Mono:wght@400;700&display=swap"
           rel="stylesheet"
         />
-        <Navbar isDark={isDark} setIsDark={setIsDark} />
+        <Navbar
+          isDark={isDark}
+          setIsDark={setIsDark}
+          colorBlind={colorBlind}
+          setColorBlind={setColorBlind}
+        />
 
         {/* Hero */}
         <header id="hero" style={{ ...S, paddingTop: 48, paddingBottom: 36 }}>
@@ -1441,81 +1561,76 @@ export default function App() {
           <SectionTitle
             number="02"
             title="Inference Speed"
-            subtitle="V100 GPU wall-clock comparison"
           />
-          <div
-            style={{
-              display: "flex",
-              marginBottom: 20,
-              background: t.surface,
-              borderRadius: 8,
-              overflow: "hidden",
-              border: `1px solid ${t.border}`,
-              width: "fit-content",
-            }}
-          >
-            {["single", "multi"].map((m) => (
-              <button
-                key={m}
-                onClick={() => setSpeedMode(m)}
+          {hasSpeedMetrics && (
+            <>
+              <div
                 style={{
+                  display: "inline-flex",
+                  marginBottom: 20,
+                  background: t.accentBg,
+                  borderRadius: 8,
+                  overflow: "hidden",
+                  border: `1px solid ${t.accentBorder}`,
+                  width: "fit-content",
                   padding: "8px 18px",
                   fontSize: 14,
-                  color: speedMode === m ? t.accent : t.textMuted,
-                  background: speedMode === m ? t.accentBg : "transparent",
-                  border: "none",
-                  cursor: "pointer",
-                  fontWeight: speedMode === m ? 600 : 400,
+                  color: t.accent,
+                  fontWeight: 600,
                   fontFamily: "'JetBrains Mono'",
                 }}
               >
-                {m === "single" ? "1 Protein" : "100 Proteins"}
-              </button>
-            ))}
-          </div>
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "1fr 1fr",
-              gap: 20,
-              alignItems: "start",
-            }}
-          >
-            <div
-              style={{
-                background: t.surface,
-                border: `1px solid ${t.border}`,
-                borderRadius: 14,
-                padding: 18,
-                boxShadow: t.cardShadow,
-              }}
-            >
-              <Plot
-                id="spd"
-                data={sT}
-                layout={sL}
-                style={{ width: "100%", height: 320 }}
-              />
-            </div>
-            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-              <MetricCard
-                label="Speed Advantage"
-                value={`${ratio}×`}
-                sub="ESM-2 faster"
-                accent
-              />
-              <MetricCard
-                label="UniRep"
-                value={`${SPEED[sm].unirep}s`}
-                sub="mLSTM sequential"
-              />
-              <MetricCard
-                label="ESM-2"
-                value={`${SPEED[sm].esm2}s`}
-                sub="Transformer parallel"
-              />
-            </div>
-          </div>
+                {proteinLabel}
+              </div>
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "1fr 1fr",
+                  gap: 20,
+                  alignItems: "start",
+                }}
+              >
+                <div
+                  style={{
+                    background: t.surface,
+                    border: `1px solid ${t.border}`,
+                    borderRadius: 14,
+                    padding: 18,
+                    boxShadow: t.cardShadow,
+                  }}
+                >
+                  <Plot
+                    id="spd"
+                    data={sT}
+                    layout={sL}
+                    style={{ width: "100%", height: 320 }}
+                  />
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                  <MetricCard
+                    label="Speed Advantage"
+                    value={`${speedRatioLabel}×`}
+                    sub="ESM-2 faster"
+                    accent
+                  />
+                  {avgUnirep !== null && (
+                    <MetricCard
+                      label="UniRep Avg"
+                      value={`${avgUnirep.toFixed(3)}s`}
+                      sub="per protein"
+                    />
+                  )}
+                  {avgEsm2 !== null && (
+                    <MetricCard
+                      label="ESM-2 Avg"
+                      value={`${avgEsm2.toFixed(3)}s`}
+                      sub="per protein"
+                    />
+                  )}
+                </div>
+              </div>
+            </>
+          )}
         </section>
 
         {/* Quality */}

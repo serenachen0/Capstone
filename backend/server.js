@@ -235,6 +235,7 @@ function appendJobLog(jobId, line) {
 
 function runScript(jobId, scriptName, phaseLabel, env = {}) {
   return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
     const job = jobs.get(jobId);
     if (!job) return reject(new Error("Job not found"));
 
@@ -269,8 +270,10 @@ function runScript(jobId, scriptName, phaseLabel, env = {}) {
     proc.stderr.on("data", onData);
 
     proc.on("close", (code) => {
-      if (code === 0) resolve();
-      else {
+      if (code === 0) {
+        const elapsedSec = Number(((Date.now() - startedAt) / 1000).toFixed(3));
+        resolve({ elapsedSec });
+      } else {
         const latest = jobs.get(jobId);
         const logs = latest?.logs || [];
         const tail = logs.slice(-12).join("\n");
@@ -310,7 +313,7 @@ function collectOutputs(model) {
   return outputs;
 }
 
-function buildResult(files, model) {
+function buildResult(files, model, metrics = {}) {
   const produced = collectOutputs(model);
   const unirepOutputs = produced.filter((x) => x.model === "unirep");
   const esmOutputs = produced.filter((x) => x.model === "esm2");
@@ -364,6 +367,7 @@ function buildResult(files, model) {
     files: parsed,
     downloads,
     plots,
+    metrics,
     reproducibility: {
       unirep: model === "both" || model === "unirep" ? REPRO : null,
       esm2: model === "both" || model === "esm2" ? ESM : null,
@@ -392,9 +396,18 @@ app.post("/api/run", async (req, res) => {
   try {
     const fastaPath = writeInputFasta(files, jobId);
     const sharedEnv = { FASTA_FILE: fastaPath, FASTA: fastaPath };
+    const metrics = {
+      sequenceCount: files.reduce((sum, f) => sum + parseFasta(f.content || "").length, 0),
+      unirepSec: null,
+      esm2Sec: null,
+      totalSec: null,
+      speedup: null,
+    };
+    const totalStartedAt = Date.now();
 
     if (model === "both" || model === "unirep") {
-      await runScript(jobId, "unirep_r_auto_pipeline.py", "running_unirep", sharedEnv);
+      const unirepRun = await runScript(jobId, "unirep_r_auto_pipeline.py", "running_unirep", sharedEnv);
+      metrics.unirepSec = unirepRun?.elapsedSec ?? null;
       const j = jobs.get(jobId);
       if (j) {
         j.progress = Math.max(j.progress, 50);
@@ -403,7 +416,8 @@ app.post("/api/run", async (req, res) => {
     }
 
     if (model === "both" || model === "esm2") {
-      await runScript(jobId, "esm_auto_pipeline.py", "running_esm2", sharedEnv);
+      const esmRun = await runScript(jobId, "esm_auto_pipeline.py", "running_esm2", sharedEnv);
+      metrics.esm2Sec = esmRun?.elapsedSec ?? null;
       const j = jobs.get(jobId);
       if (j) {
         j.progress = Math.max(j.progress, 90);
@@ -411,7 +425,12 @@ app.post("/api/run", async (req, res) => {
       }
     }
 
-    const result = buildResult(files, model);
+    metrics.totalSec = Number(((Date.now() - totalStartedAt) / 1000).toFixed(3));
+    if (metrics.unirepSec && metrics.esm2Sec && metrics.esm2Sec > 0) {
+      metrics.speedup = Number((metrics.unirepSec / metrics.esm2Sec).toFixed(2));
+    }
+
+    const result = buildResult(files, model, metrics);
     const done = jobs.get(jobId);
     if (done) {
       done.status = "complete";
