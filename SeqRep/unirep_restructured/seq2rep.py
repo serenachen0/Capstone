@@ -16,6 +16,7 @@ import h5py
 import numpy as np
 import tensorflow as tf
 from Bio import SeqIO
+from multiprocessing import Pool
 
 # ============================================================
 # CRITICAL: Set determinism BEFORE any TensorFlow operations
@@ -146,6 +147,12 @@ def validate_sequence(seq: str, max_len: int = 2000) -> tuple:
 
     return True, seq, ""
 
+def worker(args):
+    seq, model_path, units, seed = args
+    set_determinism(seed)
+    model = load_model(model_path, units, seed)
+    return model.get_representation(seq)
+
 # ============================================================
 # MAIN PROCESSING
 # ============================================================
@@ -184,40 +191,50 @@ def run(args):
     processed = 0
     skipped = 0
 
-    # Pass filename string directly — avoids unclosed file handle
+    records = list(SeqIO.parse(seqfl, 'fasta'))
+
+    valid_data = []
+    ids = []
+
+    for i, fasta in enumerate(records):
+        id_line = fasta.description
+        aa_seq = str(fasta.seq)
+        target_id = id_line.split()[0]
+
+        is_valid, cleaned_seq, error = validate_sequence(aa_seq)
+        if not is_valid:
+            print(f"  [{i+1}] SKIP  {target_id}: {error}")
+            skipped += 1
+            continue
+
+        valid_data.append(cleaned_seq)
+        ids.append(target_id)
+
+    from multiprocessing import Pool
+
+    args_list = [(seq, model_path, units, seed) for seq in valid_data]
+
+    with Pool(20) as p:
+        results = p.map(worker, args_list)
+
     with h5py.File(outfl, "w") as hf:
-        for i, fasta in enumerate(SeqIO.parse(seqfl, 'fasta')):
-            id_line = fasta.description
-            aa_seq = str(fasta.seq)
-            target_id = id_line.split()[0]
+        for i, (target_id, res) in enumerate(zip(ids, results)):
+            avg_hidden, final_hidden, final_cell = res
 
-            is_valid, cleaned_seq, error = validate_sequence(aa_seq)
-            if not is_valid:
-                print(f"  [{i+1}] SKIP  {target_id}: {error}")
-                skipped += 1
-                continue
+            if output_type == "avg":
+                hf.create_dataset(target_id, data=avg_hidden)
+            elif output_type == "final_hidden":
+                hf.create_dataset(target_id, data=final_hidden)
+            elif output_type == "final_cell":
+                hf.create_dataset(target_id, data=final_cell)
+            else:
+                grp = hf.create_group(target_id)
+                grp.create_dataset("avg_hidden", data=avg_hidden)
+                grp.create_dataset("final_hidden", data=final_hidden)
+                grp.create_dataset("final_cell", data=final_cell)
 
-            try:
-                avg_hidden, final_hidden, final_cell = model.get_representation(cleaned_seq)
-
-                if output_type == "avg":
-                    hf.create_dataset(target_id, data=avg_hidden)
-                elif output_type == "final_hidden":
-                    hf.create_dataset(target_id, data=final_hidden)
-                elif output_type == "final_cell":
-                    hf.create_dataset(target_id, data=final_cell)
-                else:  # all
-                    grp = hf.create_group(target_id)
-                    grp.create_dataset("avg_hidden", data=avg_hidden)
-                    grp.create_dataset("final_hidden", data=final_hidden)
-                    grp.create_dataset("final_cell", data=final_cell)
-
-                processed += 1
-                print(f"  [{i+1}] OK    {target_id} (len={len(cleaned_seq)})")
-
-            except Exception as e:
-                print(f"  [{i+1}] ERROR {target_id}: {e}")
-                skipped += 1
+            processed += 1
+            print(f"  [{i+1}] OK    {target_id}")
 
     elapsed = time.time() - start_time
     print("-" * 50)
@@ -238,4 +255,6 @@ def main():
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.set_start_method("spawn")
     main()
